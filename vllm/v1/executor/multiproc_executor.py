@@ -102,6 +102,8 @@ class MultiprocExecutor(Executor):
         self.is_failed = False
         self.shutdown_event = threading.Event()
         self.failure_callback: FailureCallback | None = None
+        self.failure_detail_lock = threading.Lock()
+        self.failure_detail: str | None = None
 
         self.world_size = self.parallel_config.world_size
         assert self.world_size % self.parallel_config.nnodes_within_dp == 0, (
@@ -226,7 +228,15 @@ class MultiprocExecutor(Executor):
             if not _self or getattr(_self, "shutting_down", False):
                 return
             _self.is_failed = True
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
+            dead_worker = next(h for h in workers if h.proc.sentinel == died[0])
+            proc_name = dead_worker.proc.name
+            detail = (
+                "worker_monitor_detected_dead_proc "
+                f"name={proc_name} pid={dead_worker.proc.pid} "
+                f"exitcode={dead_worker.proc.exitcode}"
+            )
+            _self._set_failure_detail(detail)
+            logger.critical("DIAG_EXECUTOR_WORKER_FATAL %s", detail)
             logger.error(
                 "Worker proc %s died unexpectedly, shutting down executor.", proc_name
             )
@@ -234,6 +244,10 @@ class MultiprocExecutor(Executor):
             callback = _self.failure_callback
             if callback is not None:
                 _self.failure_callback = None
+                logger.critical(
+                    "DIAG_EXECUTOR_FAILURE_CALLBACK_INVOKE detail=%s",
+                    _self.peek_failure_detail(),
+                )
                 callback()
 
         if not inline:
@@ -246,9 +260,27 @@ class MultiprocExecutor(Executor):
 
     def register_failure_callback(self, callback: FailureCallback):
         if self.is_failed:
+            logger.critical(
+                "DIAG_EXECUTOR_FAILURE_CALLBACK_IMMEDIATE detail=%s",
+                self.peek_failure_detail(),
+            )
             callback()
         else:
             self.failure_callback = callback
+
+    def _set_failure_detail(self, detail: str) -> None:
+        with self.failure_detail_lock:
+            self.failure_detail = detail
+
+    def peek_failure_detail(self) -> str | None:
+        with self.failure_detail_lock:
+            return self.failure_detail
+
+    def consume_failure_detail(self) -> str | None:
+        with self.failure_detail_lock:
+            detail = self.failure_detail
+            self.failure_detail = None
+            return detail
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -299,6 +331,9 @@ class MultiprocExecutor(Executor):
             "collective_rpc should not be called on follower node"
         )
         if self.is_failed:
+            detail = self.peek_failure_detail()
+            if detail:
+                raise RuntimeError(f"Executor failed: {detail}")
             raise RuntimeError("Executor failed.")
 
         deadline = None if timeout is None else time.monotonic() + timeout

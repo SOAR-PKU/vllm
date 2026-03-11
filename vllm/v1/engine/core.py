@@ -5,6 +5,7 @@ import queue
 import signal
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -69,6 +70,13 @@ logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
+DIAG_CORE_HEARTBEAT_INTERVAL_S = 5.0
+DIAG_CORE_ADD_LOG_EVERY = 100
+DIAG_CORE_ADD_LOG_INITIAL = 5
+ENGINE_CORE_DEAD_DETAIL_MAX_BYTES = 256 * 1024
+EXECUTOR_FAILED_SRC_CALLBACK = "executor_failure_callback"
+EXECUTOR_FAILED_SRC_INPUT_THREAD = "process_input_sockets_fatal"
+EXECUTOR_FAILED_SRC_UNKNOWN = "unknown"
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -566,14 +574,34 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
-        executor_fail_callback = lambda: self.input_queue.put_nowait(
-            (EngineCoreRequestType.EXECUTOR_FAILED, b"")
-        )
+        self.output_queue = queue.Queue[
+            tuple[int, EngineCoreOutputs] | bytes | tuple[bytes, ...]
+        ]()
+
+        def executor_fail_callback() -> None:
+            detail = self.model_executor.consume_failure_detail()
+            payload = self._build_executor_failed_payload(
+                EXECUTOR_FAILED_SRC_CALLBACK, detail
+            )
+            logger.critical(
+                "DIAG_CORE_EXECUTOR_FAILED_SIGNAL source=%s detail=%s "
+                "input_queue_size=%d",
+                payload["source"],
+                payload["detail"],
+                self.input_queue.qsize(),
+            )
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.EXECUTOR_FAILED, payload)
+            )
 
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
+        self._diag_core_loop_iter = 0
+        self._diag_core_last_loop_log = time.monotonic()
+        self._diag_core_in_recv_count = 0
+        self._diag_core_in_add_count = 0
+        self._diag_core_handle_add_count = 0
 
         with self._perform_handshakes(
             handshake_address,
@@ -650,6 +678,35 @@ class EngineCoreProc(EngineCore):
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    @staticmethod
+    def _build_executor_failed_payload(
+        source: str,
+        detail: str | None = None,
+    ) -> dict[str, str]:
+        return {
+            "source": source or EXECUTOR_FAILED_SRC_UNKNOWN,
+            "detail": detail or "",
+        }
+
+    @staticmethod
+    def _parse_executor_failed_payload(payload: Any) -> tuple[str, str]:
+        if isinstance(payload, dict):
+            source = str(payload.get("source") or EXECUTOR_FAILED_SRC_UNKNOWN)
+            detail = str(payload.get("detail") or "")
+            return source, detail
+
+        if isinstance(payload, (bytes, bytearray)):
+            detail = bytes(payload).decode("utf-8", errors="replace")
+            source = (
+                EXECUTOR_FAILED_SRC_UNKNOWN if not detail else "legacy_bytes_payload"
+            )
+            return source, detail
+
+        if payload is None:
+            return EXECUTOR_FAILED_SRC_UNKNOWN, ""
+
+        return type(payload).__name__, str(payload)
 
     @contextmanager
     def _perform_handshakes(
@@ -838,11 +895,12 @@ class EngineCoreProc(EngineCore):
             logger.debug("EngineCore exiting.")
             raise
         except Exception as e:
+            fatal_detail = traceback.format_exc()
             if engine_core is None:
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
-                engine_core._send_engine_dead()
+                engine_core._send_engine_dead(fatal_detail)
             raise e
         finally:
             if engine_core is not None:
@@ -856,10 +914,32 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            self._maybe_log_core_loop_heartbeat()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
+
+    def _maybe_log_core_loop_heartbeat(self) -> None:
+        """Emit periodic health logs for the core busy loop."""
+
+        self._diag_core_loop_iter += 1
+        now = time.monotonic()
+        if now - self._diag_core_last_loop_log < DIAG_CORE_HEARTBEAT_INTERVAL_S:
+            return
+
+        batch_queue_len = len(self.batch_queue) if self.batch_queue is not None else 0
+        logger.warning(
+            "DIAG_CORE_LOOP iter=%d input_queue_size=%d has_requests=%s "
+            "has_unfinished=%s engines_running=%s batch_queue_len=%d",
+            self._diag_core_loop_iter,
+            self.input_queue.qsize(),
+            self.scheduler.has_requests(),
+            self.scheduler.has_unfinished_requests(),
+            self.engines_running,
+            batch_queue_len,
+        )
+        self._diag_core_last_loop_log = now
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -904,6 +984,21 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            self._diag_core_handle_add_count += 1
+            if (
+                self._diag_core_handle_add_count <= DIAG_CORE_ADD_LOG_INITIAL
+                or self._diag_core_handle_add_count % DIAG_CORE_ADD_LOG_EVERY == 0
+            ):
+                logger.warning(
+                    "DIAG_CORE_HANDLE_ADD count=%d request_id=%s request_wave=%s "
+                    "input_queue_size=%d has_requests=%s has_unfinished=%s",
+                    self._diag_core_handle_add_count,
+                    req.request_id,
+                    request_wave,
+                    self.input_queue.qsize(),
+                    self.scheduler.has_requests(),
+                    self.scheduler.has_unfinished_requests(),
+                )
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -923,7 +1018,20 @@ class EngineCoreProc(EngineCore):
                 (client_idx, EngineCoreOutputs(utility_output=output))
             )
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
-            raise RuntimeError("Executor failed.")
+            source, detail = self._parse_executor_failed_payload(request)
+            logger.critical(
+                "DIAG_CORE_EXECUTOR_FAILED_CONSUMED source=%s detail=%s "
+                "input_queue_size=%d has_requests=%s has_unfinished=%s",
+                source,
+                detail,
+                self.input_queue.qsize(),
+                self.scheduler.has_requests(),
+                self.scheduler.has_unfinished_requests(),
+            )
+            error = f"Executor failed. source={source}"
+            if detail:
+                error = f"{error}, detail={detail}"
+            raise RuntimeError(error)
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
@@ -946,11 +1054,19 @@ class EngineCoreProc(EngineCore):
             for v, p in zip(args, arg_types)
         )
 
-    def _send_engine_dead(self):
+    def _send_engine_dead(self, fatal_detail: str | None = None):
         """Send EngineDead status to the EngineCoreClient."""
 
-        # Put ENGINE_CORE_DEAD in the queue.
-        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
+        if fatal_detail:
+            detail_bytes = fatal_detail.encode("utf-8", errors="replace")
+            if len(detail_bytes) > ENGINE_CORE_DEAD_DETAIL_MAX_BYTES:
+                # Keep the tail where the fatal stacktrace and root error are.
+                detail_bytes = detail_bytes[-ENGINE_CORE_DEAD_DETAIL_MAX_BYTES:]
+            self.output_queue.put_nowait(
+                (EngineCoreProc.ENGINE_CORE_DEAD, detail_bytes)
+            )
+        else:
+            self.output_queue.put_nowait((EngineCoreProc.ENGINE_CORE_DEAD,))
 
         # Wait until msg sent by the daemon before shutdown.
         self.output_thread.join(timeout=5.0)
@@ -1013,21 +1129,109 @@ class EngineCoreProc(EngineCore):
 
             ready_event.set()
             del ready_event
-            while True:
-                for input_socket, _ in poller.poll():
-                    # (RequestType, RequestData)
-                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
-                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+            last_diag_log = time.monotonic()
+            try:
+                while True:
+                    for input_socket, _ in poller.poll():
+                        # (RequestType, RequestData)
+                        type_frame, *data_frames = input_socket.recv_multipart(
+                            copy=False
+                        )
+                        self._diag_core_in_recv_count += 1
+                        now = time.monotonic()
+                        if now - last_diag_log >= DIAG_CORE_HEARTBEAT_INTERVAL_S:
+                            logger.warning(
+                                "DIAG_CORE_IN_RECV packets=%d add_packets=%d "
+                                "input_queue_size=%d",
+                                self._diag_core_in_recv_count,
+                                self._diag_core_in_add_count,
+                                self.input_queue.qsize(),
+                            )
+                            last_diag_log = now
 
-                    # Deserialize the request data.
-                    if request_type == EngineCoreRequestType.ADD:
-                        request = add_request_decoder.decode(data_frames)
-                        request = self.preprocess_add_request(request)
-                    else:
-                        request = generic_decoder.decode(data_frames)
+                        try:
+                            request_type = EngineCoreRequestType(
+                                bytes(type_frame.buffer)
+                            )
+                        except Exception:
+                            logger.exception(
+                                "DIAG_CORE_IN_ERR request_type_decode_failed "
+                                "frame_count=%d input_queue_size=%d",
+                                len(data_frames) + 1,
+                                self.input_queue.qsize(),
+                            )
+                            raise
 
-                    # Push to input queue for core busy loop.
-                    self.input_queue.put_nowait((request_type, request))
+                        # Deserialize the request data.
+                        try:
+                            if request_type == EngineCoreRequestType.ADD:
+                                request = add_request_decoder.decode(data_frames)
+                                request = self.preprocess_add_request(request)
+                                self._diag_core_in_add_count += 1
+                                if (
+                                    self._diag_core_in_add_count
+                                    <= DIAG_CORE_ADD_LOG_INITIAL
+                                    or self._diag_core_in_add_count
+                                    % DIAG_CORE_ADD_LOG_EVERY
+                                    == 0
+                                ):
+                                    req, request_wave = request
+                                    logger.warning(
+                                        "DIAG_CORE_IN_ADD_RECEIVED count=%d "
+                                        "request_id=%s request_wave=%s "
+                                        "input_queue_size=%d",
+                                        self._diag_core_in_add_count,
+                                        req.request_id,
+                                        request_wave,
+                                        self.input_queue.qsize(),
+                                    )
+                            else:
+                                request = generic_decoder.decode(data_frames)
+                        except Exception:
+                            logger.exception(
+                                "DIAG_CORE_IN_ERR request_decode_preprocess_failed "
+                                "request_type=%s frame_count=%d input_queue_size=%d",
+                                request_type,
+                                len(data_frames),
+                                self.input_queue.qsize(),
+                            )
+                            raise
+
+                        # Push to input queue for core busy loop.
+                        try:
+                            self.input_queue.put_nowait((request_type, request))
+                        except Exception:
+                            logger.exception(
+                                "DIAG_CORE_IN_ERR enqueue_failed request_type=%s "
+                                "input_queue_size=%d",
+                                request_type,
+                                self.input_queue.qsize(),
+                            )
+                            raise
+            except Exception:
+                fatal_detail = traceback.format_exc()
+                detail_bytes = fatal_detail.encode("utf-8", errors="replace")
+                if len(detail_bytes) > ENGINE_CORE_DEAD_DETAIL_MAX_BYTES:
+                    # Keep the tail where root cause lines are usually present.
+                    detail_bytes = detail_bytes[-ENGINE_CORE_DEAD_DETAIL_MAX_BYTES:]
+                    fatal_detail = detail_bytes.decode("utf-8", errors="replace")
+                logger.exception(
+                    "DIAG_CORE_IN_THREAD_FATAL: process_input_sockets crashed"
+                )
+                payload = self._build_executor_failed_payload(
+                    EXECUTOR_FAILED_SRC_INPUT_THREAD,
+                    fatal_detail,
+                )
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.EXECUTOR_FAILED, payload)
+                )
+                logger.critical(
+                    "DIAG_CORE_IN_THREAD_FATAL: queued EXECUTOR_FAILED "
+                    "source=%s detail_len=%d for busy loop",
+                    payload["source"],
+                    len(payload["detail"]),
+                )
+                raise
 
     def process_output_sockets(
         self,
@@ -1071,6 +1275,14 @@ class EngineCoreProc(EngineCore):
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
+                    break
+                if (
+                    isinstance(output, tuple)
+                    and output
+                    and output[0] == EngineCoreProc.ENGINE_CORE_DEAD
+                ):
+                    for socket in sockets:
+                        socket.send_multipart(output)
                     break
                 assert not isinstance(output, bytes)
                 client_index, outputs = output
@@ -1206,6 +1418,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
+            self._maybe_log_core_loop_heartbeat()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 

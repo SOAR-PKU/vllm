@@ -402,6 +402,8 @@ class AsyncLLM(EngineClient):
                     tokenization_kwargs,
                 )
 
+            add_request_start = time.monotonic()
+            logger.info("DIAG_GENERATE_BEFORE_ADD request_id=%s", request_id)
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -413,20 +415,41 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank=data_parallel_rank,
                 prompt_text=prompt_text,
             )
+            logger.info(
+                "DIAG_GENERATE_AFTER_ADD request_id=%s add_request_ms=%.3f",
+                request_id,
+                (time.monotonic() - add_request_start) * 1000,
+            )
 
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
+            first_item_seen = False
+            yielded_count = 0
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
                 out = q.get_nowait() or await q.get()
+                if not first_item_seen:
+                    logger.info(
+                        "DIAG_GENERATE_FIRST_QUEUE_ITEM request_id=%s finished=%s",
+                        request_id,
+                        out.finished,
+                    )
+                    first_item_seen = True
 
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
                 finished = out.finished
                 assert isinstance(out, RequestOutput)
+                yielded_count += 1
                 yield out
+
+            logger.info(
+                "DIAG_GENERATE_FINISHED request_id=%s yielded_count=%d",
+                request_id,
+                yielded_count,
+            )
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
@@ -471,11 +494,31 @@ class AsyncLLM(EngineClient):
         processor = self.processor
 
         async def output_handler():
+            iteration_idx = 0
+            last_heartbeat_log = time.monotonic()
             try:
                 while True:
+                    iteration_idx += 1
                     # 1) Pull EngineCoreOutputs from the EngineCore.
+                    recv_start = time.monotonic()
                     outputs = await engine_core.get_output_async()
+                    recv_wait_ms = (time.monotonic() - recv_start) * 1000
                     num_outputs = len(outputs.outputs)
+                    now = time.monotonic()
+                    should_log_heartbeat = (
+                        num_outputs > 0 or now - last_heartbeat_log >= 5
+                    )
+                    if should_log_heartbeat:
+                        logger.info(
+                            "DIAG_OH_RECV iter=%d recv_wait_ms=%.3f num_outputs=%d "
+                            "has_scheduler_stats=%s engine_index=%d",
+                            iteration_idx,
+                            recv_wait_ms,
+                            num_outputs,
+                            outputs.scheduler_stats is not None,
+                            outputs.engine_index,
+                        )
+                        last_heartbeat_log = now
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -493,10 +536,29 @@ class AsyncLLM(EngineClient):
                         )
 
                     for i, outputs_slice in enumerate(slices):
+                        if num_outputs > 0:
+                            logger.info(
+                                "DIAG_OH_BEFORE_PROCESS iter=%d slice=%d/%d "
+                                "slice_len=%d",
+                                iteration_idx,
+                                i + 1,
+                                len(slices),
+                                len(outputs_slice),
+                            )
+                        process_start = time.monotonic()
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats
                         )
+                        if num_outputs > 0:
+                            logger.info(
+                                "DIAG_OH_AFTER_PROCESS iter=%d slice=%d "
+                                "process_ms=%.3f reqs_to_abort=%d",
+                                iteration_idx,
+                                i + 1,
+                                (time.monotonic() - process_start) * 1000,
+                                len(processed_outputs.reqs_to_abort),
+                            )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
 
@@ -515,11 +577,18 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if logger_manager:
+                        logger.info("DIAG_OH_BEFORE_LOGGER iter=%d", iteration_idx)
+                        logger_start = time.monotonic()
                         logger_manager.record(
                             engine_idx=outputs.engine_index,
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
                             mm_cache_stats=processor.stat_mm_cache(),
+                        )
+                        logger.info(
+                            "DIAG_OH_AFTER_LOGGER iter=%d logger_ms=%.3f",
+                            iteration_idx,
+                            (time.monotonic() - logger_start) * 1000,
                         )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")

@@ -122,6 +122,10 @@ class Executor(ABC):
         """
         pass
 
+    def consume_failure_detail(self) -> str | None:
+        """Return and clear the latest executor-side failure detail."""
+        return None
+
     def determine_available_memory(self) -> list[int]:  # in bytes
         return self.collective_rpc("determine_available_memory")
 

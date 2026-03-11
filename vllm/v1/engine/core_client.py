@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -354,6 +355,7 @@ class BackgroundResources:
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    engine_dead_detail: str | None = None
 
     def __call__(self):
         """Clean up background resources."""
@@ -413,9 +415,18 @@ class BackgroundResources:
                     shutdown_sender.send(b"")
 
     def validate_alive(self, frames: Sequence[zmq.Frame]):
-        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
+        if frames and frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD:
             self.engine_dead = True
-            raise EngineDeadError()
+            detail: str | None = None
+            if len(frames) >= 2:
+                detail = bytes(frames[1].buffer).decode("utf-8", errors="replace")
+                self.engine_dead_detail = detail
+                logger.error(
+                    "DIAG_ENGINE_CORE_FATAL_DETAIL_BEGIN\n%s\n"
+                    "DIAG_ENGINE_CORE_FATAL_DETAIL_END",
+                    detail,
+                )
+            raise EngineDeadError(detail)
 
 
 class MPClient(EngineCoreClient):
@@ -549,13 +560,18 @@ class MPClient(EngineCoreClient):
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
-        return (
-            EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
+        if not self.resources.engine_dead:
+            return e
+        if isinstance(e, EngineDeadError):
+            return e
+        return EngineDeadError(
+            self.resources.engine_dead_detail,
+            suppress_context=True,
         )
 
     def ensure_alive(self):
         if self.resources.engine_dead:
-            raise EngineDeadError()
+            raise EngineDeadError(self.resources.engine_dead_detail)
 
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
         if not tracker.done:
@@ -844,12 +860,32 @@ class AsyncMPClient(MPClient):
         assert output_socket is not None
 
         async def process_outputs_socket():
+            packet_count = 0
+            utility_count = 0
+            payload_count = 0
+            last_heartbeat_log = time.monotonic()
             try:
                 while True:
+                    recv_start = time.monotonic()
                     frames = await output_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
+                    recv_wait_ms = (time.monotonic() - recv_start) * 1000
+                    packet_count += 1
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
+                        utility_count += 1
+                        now = time.monotonic()
+                        if now - last_heartbeat_log >= 5:
+                            logger.info(
+                                "DIAG_CORE_CLIENT_HEARTBEAT packets=%d payload=%d "
+                                "utility=%d recv_wait_ms=%.3f queue_size=%d",
+                                packet_count,
+                                payload_count,
+                                utility_count,
+                                recv_wait_ms,
+                                outputs_queue.qsize(),
+                            )
+                            last_heartbeat_log = now
                         _process_utility_output(outputs.utility_output, utility_results)
                         continue
 
@@ -862,7 +898,19 @@ class AsyncMPClient(MPClient):
                         await output_handler(_self, outputs)
 
                     if outputs.outputs or outputs.scheduler_stats:
+                        payload_count += 1
                         outputs_queue.put_nowait(outputs)
+                        logger.info(
+                            "DIAG_CORE_CLIENT_PAYLOAD packets=%d payload=%d "
+                            "num_outputs=%d has_scheduler_stats=%s "
+                            "recv_wait_ms=%.3f queue_size=%d",
+                            packet_count,
+                            payload_count,
+                            len(outputs.outputs),
+                            outputs.scheduler_stats is not None,
+                            recv_wait_ms,
+                            outputs_queue.qsize(),
+                        )
             except Exception as e:
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:

@@ -9,10 +9,21 @@ class EngineGenerateError(Exception):
 class EngineDeadError(Exception):
     """Raised when the EngineCore dies. Unrecoverable."""
 
-    def __init__(self, *args, suppress_context: bool = False, **kwargs):
-        ENGINE_DEAD_MESSAGE = "EngineCore encountered an issue. See stack trace (above) for the root cause."  # noqa: E501
+    def __init__(
+        self,
+        detail: str | None = None,
+        *args,
+        suppress_context: bool = False,
+        **kwargs,
+    ):
+        base_message = "EngineCore encountered an issue. See stack trace (above) for the root cause."  # noqa: E501
+        self.detail = detail
+        if detail:
+            message = f"{base_message}\nEngineCore fatal detail:\n{detail}"
+        else:
+            message = base_message
 
-        super().__init__(ENGINE_DEAD_MESSAGE, *args, **kwargs)
+        super().__init__(message, *args, **kwargs)
         # Make stack trace clearer when using with LLMEngine by
         # silencing irrelevant ZMQError.
         self.__suppress_context__ = suppress_context
