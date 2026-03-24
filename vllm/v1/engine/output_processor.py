@@ -472,6 +472,29 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+            if req_state.stats is not None:
+                req_state.stats.local_cached_tokens = (
+                    engine_core_output.local_cached_tokens
+                )
+                req_state.stats.total_cached_tokens = (
+                    engine_core_output.num_cached_tokens
+                )
+                req_state.stats.total_cache_hit_rate = (
+                    engine_core_output.num_cached_tokens
+                    / engine_core_output.lmcache_total_prompt_tokens
+                    if engine_core_output.lmcache_total_prompt_tokens > 0
+                    else 0.0
+                )
+                req_state.stats.lmcache_hit_tokens = (
+                    engine_core_output.lmcache_hit_tokens
+                )
+                req_state.stats.lmcache_total_prompt_tokens = (
+                    engine_core_output.lmcache_total_prompt_tokens
+                )
+                req_state.stats.lmcache_need_to_load_tokens = (
+                    engine_core_output.lmcache_need_to_load_tokens
+                )
+                req_state.stats.lmcache_hit_rate = engine_core_output.lmcache_hit_rate
             req_state.is_prefilling = False
 
             if pooling_output is None:

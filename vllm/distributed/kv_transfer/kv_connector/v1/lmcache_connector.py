@@ -136,6 +136,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
 
+    def take_kv_transfer_done_timestamps(self) -> dict[str, float] | None:
+        method = getattr(self._lmcache_engine, "take_kv_transfer_done_timestamps", None)
+        if callable(method):
+            return method()
+        return None
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get the set of block IDs that failed to load.

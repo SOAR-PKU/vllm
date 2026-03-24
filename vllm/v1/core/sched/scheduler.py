@@ -472,6 +472,7 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
+                    request.local_cached_tokens = num_new_local_computed_tokens
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -973,6 +974,11 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        kv_transfer_done_timestamps = (
+            kv_connector_output.kv_transfer_done_timestamps
+            if kv_connector_output is not None
+            else None
+        )
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -1083,6 +1089,12 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
+            if kv_transfer_done_timestamps and req_id in kv_transfer_done_timestamps:
+                request.record_event(
+                    EngineCoreEventType.KV_TRANSFER_DONE,
+                    timestamp=kv_transfer_done_timestamps[req_id],
+                )
+
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
@@ -1100,6 +1112,11 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        local_cached_tokens=request.local_cached_tokens,
+                        lmcache_hit_tokens=request.lmcache_hit_tokens,
+                        lmcache_total_prompt_tokens=request.lmcache_total_prompt_tokens,
+                        lmcache_need_to_load_tokens=request.lmcache_need_to_load_tokens,
+                        lmcache_hit_rate=request.lmcache_hit_rate,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )

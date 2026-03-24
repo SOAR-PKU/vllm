@@ -118,6 +118,7 @@ class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    kv_transfer_done_timestamps: dict[str, float] | None = None
     kv_connector_stats: KVConnectorStats | None = None
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
@@ -133,6 +134,7 @@ class KVConnectorOutput:
         return (
             not self.finished_sending
             and not self.finished_recving
+            and not self.kv_transfer_done_timestamps
             and not self.kv_connector_stats
             and not self.invalid_block_ids
         )

@@ -185,8 +185,16 @@ class RequestStateStats:
     # These are engine core timestamps (monotonic)
     queued_ts: float = 0.0
     scheduled_ts: float = 0.0
+    kv_transfer_done_ts: float = 0.0
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
+    local_cached_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_cache_hit_rate: float = 0.0
+    lmcache_hit_tokens: int = 0
+    lmcache_total_prompt_tokens: int = 0
+    lmcache_need_to_load_tokens: int = 0
+    lmcache_hit_rate: float = 0.0
 
     # first token latency
     first_token_latency: float = 0.0
@@ -306,6 +314,8 @@ class IterationStats:
                 if req_stats.scheduled_ts == 0.0:  # ignore preemptions
                     req_stats.scheduled_ts = event.timestamp
                 lora_states.request_running(req_id, lora_name)
+            elif event.type == EngineCoreEventType.KV_TRANSFER_DONE:
+                req_stats.kv_transfer_done_ts = event.timestamp
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)

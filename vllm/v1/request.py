@@ -113,6 +113,11 @@ class Request:
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
+        self.local_cached_tokens = 0
+        self.lmcache_hit_tokens = 0
+        self.lmcache_total_prompt_tokens = 0
+        self.lmcache_need_to_load_tokens = 0
+        self.lmcache_hit_rate = 0.0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

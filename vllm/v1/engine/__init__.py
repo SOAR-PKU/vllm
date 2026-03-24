@@ -79,6 +79,7 @@ class EngineCoreEventType(enum.IntEnum):
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3
+    KV_TRANSFER_DONE = 4
 
 
 class EngineCoreEvent(msgspec.Struct):
@@ -122,6 +123,11 @@ class EngineCoreOutput(
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    local_cached_tokens: int = 0
+    lmcache_hit_tokens: int = 0
+    lmcache_total_prompt_tokens: int = 0
+    lmcache_need_to_load_tokens: int = 0
+    lmcache_hit_rate: float = 0.0
 
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.

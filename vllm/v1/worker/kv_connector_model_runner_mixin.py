@@ -130,6 +130,9 @@ class KVConnectorModelRunnerMixin:
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )
+            output.kv_transfer_done_timestamps = (
+                kv_connector.take_kv_transfer_done_timestamps()
+            )
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
             output.kv_connector_stats = (

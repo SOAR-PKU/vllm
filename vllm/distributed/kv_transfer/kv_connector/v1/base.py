@@ -316,6 +316,15 @@ class KVConnectorBase_V1(ABC):
         """
         return None, None
 
+    def take_kv_transfer_done_timestamps(self) -> dict[str, float] | None:
+        """
+        Return per-request worker monotonic timestamps for KV load completion.
+
+        This is used by connectors whose load path does not surface completion
+        through finished_recving/WAITING_FOR_REMOTE_KVS.
+        """
+        return None
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get the set of block IDs that failed to load.

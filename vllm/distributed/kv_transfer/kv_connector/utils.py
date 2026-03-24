@@ -159,6 +159,7 @@ class KVOutputAggregator:
 
         finished_sending = set[str]()
         finished_recving = set[str]()
+        kv_transfer_done_timestamps = dict[str, float]()
         aggregated_kv_connector_stats = None
         invalid_block_ids = set[int]()
         for model_runner_output in outputs:
@@ -185,6 +186,10 @@ class KVOutputAggregator:
             update_finished_set(
                 kv_output.finished_recving, self._recv_remaining_count, finished_recving
             )
+            for req_id, ts in (kv_output.kv_transfer_done_timestamps or {}).items():
+                existing = kv_transfer_done_timestamps.get(req_id)
+                if existing is None or ts > existing:
+                    kv_transfer_done_timestamps[req_id] = ts
 
             # Aggregate kv_connector_stats from all workers.
             if aggregated_kv_connector_stats is None:
@@ -210,6 +215,7 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            kv_transfer_done_timestamps=kv_transfer_done_timestamps or None,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             invalid_block_ids=invalid_block_ids,
             expected_finished_count=self._expected_finished_count,
