@@ -48,6 +48,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+INTERRUPT_PRIORITY_REQUEST_ID_MARKER = "__interrupt_priority__"
+INTERRUPT_WORK_FALSE_CONTINUE = "false_continue"
+INTERRUPT_WORK_TRUE_ROLLBACK_APPEND = "true_rollback_append"
+INTERRUPT_WORK_RECOVERY_EVICTION = "recovery_eviction"
+INTERRUPT_RECOVERY_PROTECT_STEPS = 2
+INTERRUPT_RECOVERY_PROTECT_SECONDS = 0.1
+INTERRUPT_MAX_VICTIMS_PER_ADMISSION = 1
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -133,7 +141,13 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
+        self.interrupt_waiting = create_request_queue(SchedulingPolicy.FCFS)
         self.running: list[Request] = []
+        self.offloading: dict[str, Request] = {}
+        self.pending_verdict: dict[str, Request] = {}
+        self.remote_kv_loading: dict[str, Request] = {}
+        self.remote_kv_ready_interrupt = create_request_queue(SchedulingPolicy.FCFS)
+        self._interrupt_scheduler_step = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -186,6 +200,168 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    def _process_interrupt_preempt_requests(self) -> None:
+        self._complete_interrupt_offloads()
+        self._promote_finished_remote_kv_loads()
+        preempting = [
+            request
+            for request in self.running
+            if request.status == RequestStatus.INTERRUPT_PREEMPT_REQUESTED
+        ]
+        if not preempting:
+            return
+        preempting_set = set(preempting)
+        self.running = remove_all(self.running, preempting_set)
+        for request in preempting:
+            if not self._prepare_interrupt_force_save(request):
+                request.status = RequestStatus.RUNNING
+                self.running.append(request)
+                continue
+            request.status = RequestStatus.OFFLOADING_TO_LMCACHE
+            self.offloading[request.request_id] = request
+
+    def _prepare_interrupt_force_save(self, request: Request) -> bool:
+        if self.connector is None:
+            return False
+        blocks = self.kv_cache_manager.get_blocks(request.request_id)
+        block_groups = blocks.get_block_ids()
+        if not block_groups:
+            return False
+        block_ids = block_groups[0]
+        prepare_force_save = getattr(self.connector, "prepare_force_save", None)
+        if not callable(prepare_force_save):
+            return False
+        return bool(prepare_force_save(request, block_ids))
+
+    def _complete_interrupt_offloads(self) -> None:
+        if not self.offloading:
+            return
+        completed = list(self.offloading.values())
+        for request in completed:
+            self.offloading.pop(request.request_id, None)
+            if request.interrupt_work_kind == INTERRUPT_WORK_TRUE_ROLLBACK_APPEND:
+                request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
+                self._free_request(request)
+                continue
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.offloaded_restore_pending = True
+            if request.interrupt_work_kind == INTERRUPT_WORK_FALSE_CONTINUE:
+                self.enqueue_interrupt_work(request, INTERRUPT_WORK_FALSE_CONTINUE)
+                continue
+            if request.interrupt_work_kind == INTERRUPT_WORK_RECOVERY_EVICTION:
+                request.status = RequestStatus.PREEMPTED
+                request.preemptive_admit_eligible = False
+                self.waiting.add_request(request)
+                continue
+            request.status = RequestStatus.PENDING_INTERRUPT_VERDICT
+            self.pending_verdict[request.request_id] = request
+
+    def _promote_finished_remote_kv_loads(self) -> None:
+        if not self.remote_kv_loading:
+            return
+        finished_req_ids = [
+            req_id
+            for req_id in self.remote_kv_loading
+            if req_id in self.finished_recving_kv_req_ids
+        ]
+        for req_id in finished_req_ids:
+            request = self.remote_kv_loading.pop(req_id)
+            origin_interrupt = request.remote_kv_origin_interrupt
+            origin_status = request.remote_kv_origin_status
+            request.remote_kv_origin_interrupt = False
+            request.remote_kv_origin_status = None
+            if not self._update_waiting_for_remote_kv(request):
+                self.remote_kv_loading[req_id] = request
+                continue
+            request.offloaded_restore_pending = False
+            if origin_interrupt:
+                request.status = RequestStatus.Q_INTERRUPT_WAITING
+                self.remote_kv_ready_interrupt.add_request(request)
+            else:
+                request.status = (
+                    RequestStatus.WAITING
+                    if origin_status == RequestStatus.WAITING
+                    else RequestStatus.PREEMPTED
+                )
+                self.waiting.add_request(request)
+
+    def _is_recovery_protected(self, request: Request) -> bool:
+        return (
+            request.recovery_protected_until_step > self._interrupt_scheduler_step
+            or request.recovery_protected_until_ts > time.monotonic()
+        )
+
+    def _mark_recovery_protected(self, request: Request) -> None:
+        request.recovery_protected_until_step = (
+            self._interrupt_scheduler_step + INTERRUPT_RECOVERY_PROTECT_STEPS
+        )
+        request.recovery_protected_until_ts = (
+            time.monotonic() + INTERRUPT_RECOVERY_PROTECT_SECONDS
+        )
+
+    def _estimated_restore_blocks(self, request: Request) -> int:
+        token_ids = request.lmcache_lookup_token_ids
+        if token_ids is None:
+            token_count = request.num_tokens
+        else:
+            token_count = min(len(token_ids), self.max_model_len)
+        token_count = max(1, token_count + self.num_lookahead_tokens)
+        return (token_count + self.block_size - 1) // self.block_size
+
+    def _maybe_start_recovery_preemption_for_interrupt_head(self) -> None:
+        if self.offloading or not self.interrupt_waiting:
+            return
+        request = self.interrupt_waiting.peek_request()
+        if (
+            not request.preemptive_admit_eligible
+            or request.interrupt_work_kind != INTERRUPT_WORK_TRUE_ROLLBACK_APPEND
+        ):
+            return
+        if (
+            self.kv_cache_manager.block_pool.get_num_free_blocks()
+            >= self._estimated_restore_blocks(request)
+        ):
+            return
+        victims_started = 0
+        for victim in reversed(self.running):
+            if victims_started >= INTERRUPT_MAX_VICTIMS_PER_ADMISSION:
+                break
+            if not self._is_recovery_victim_eligible(victim, request):
+                continue
+            if self._prepare_recovery_victim(victim):
+                self.running.remove(victim)
+                victim.status = RequestStatus.OFFLOADING_TO_LMCACHE
+                self.offloading[victim.request_id] = victim
+                victims_started += 1
+                break
+
+    def _is_recovery_victim_eligible(
+        self,
+        victim: Request,
+        target: Request,
+    ) -> bool:
+        if victim is target:
+            return False
+        if victim.status != RequestStatus.RUNNING:
+            return False
+        if self._is_recovery_protected(victim):
+            return False
+        if victim.is_finished():
+            return False
+        return True
+
+    def _prepare_recovery_victim(self, victim: Request) -> bool:
+        victim.saved_num_computed_tokens = victim.num_computed_tokens
+        victim.saved_output_token_count = victim.num_output_tokens
+        victim.full_continuation_token_ids = list(victim.all_token_ids)
+        victim.lmcache_store_token_ids = list(victim.all_token_ids)
+        victim.lmcache_lookup_token_ids = list(victim.all_token_ids)
+        victim.suspend_reason = INTERRUPT_WORK_RECOVERY_EVICTION
+        victim.interrupt_work_kind = INTERRUPT_WORK_RECOVERY_EVICTION
+        victim.preemptive_admit_eligible = False
+        return self._prepare_interrupt_force_save(victim)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -214,6 +390,9 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        self._interrupt_scheduler_step += 1
+        self._process_interrupt_preempt_requests()
+        self._maybe_start_recovery_preemption_for_interrupt_head()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -391,14 +570,34 @@ class Scheduler(SchedulerInterface):
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
+        skipped_interrupt_requests = create_request_queue(SchedulingPolicy.FCFS)
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
-            while self.waiting and token_budget > 0:
+            while (
+                self.remote_kv_ready_interrupt
+                or self.interrupt_waiting
+                or self.waiting
+            ) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request = self.waiting.peek_request()
+                if self.remote_kv_ready_interrupt:
+                    active_waiting = self.remote_kv_ready_interrupt
+                elif self.interrupt_waiting:
+                    active_waiting = self.interrupt_waiting
+                else:
+                    active_waiting = self.waiting
+                active_waiting_is_interrupt = (
+                    active_waiting is self.interrupt_waiting
+                    or active_waiting is self.remote_kv_ready_interrupt
+                )
+                skipped_active_requests = (
+                    skipped_interrupt_requests
+                    if active_waiting_is_interrupt
+                    else skipped_waiting_requests
+                )
+                request = active_waiting.peek_request()
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -410,8 +609,8 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id,
                         )
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        active_waiting.pop_request()
+                        skipped_active_requests.prepend_request(request)
                         continue
 
                 # Skip request if the structured output request is still waiting
@@ -421,8 +620,8 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        active_waiting.pop_request()
+                        skipped_active_requests.prepend_request(request)
                         continue
 
                 # Check that adding the request still respects the max_loras
@@ -436,12 +635,16 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    active_waiting.pop_request()
+                    skipped_active_requests.prepend_request(request)
                     continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                restore_scheduling_base = request.offloaded_restore_pending
+                logical_num_computed_tokens = request.num_computed_tokens
+                if restore_scheduling_base:
+                    request.num_computed_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -462,8 +665,12 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self.waiting.pop_request()
-                            skipped_waiting_requests.prepend_request(request)
+                            if restore_scheduling_base:
+                                request.num_computed_tokens = (
+                                    logical_num_computed_tokens
+                                )
+                            active_waiting.pop_request()
+                            skipped_active_requests.prepend_request(request)
                             continue
 
                         num_external_computed_tokens = ext_tokens
@@ -504,8 +711,10 @@ class Scheduler(SchedulerInterface):
                         not self.scheduler_config.enable_chunked_prefill
                         and num_new_tokens > token_budget
                     ):
-                        self.waiting.pop_request()
-                        skipped_waiting_requests.prepend_request(request)
+                        if restore_scheduling_base:
+                            request.num_computed_tokens = logical_num_computed_tokens
+                        active_waiting.pop_request()
+                        skipped_active_requests.prepend_request(request)
                         continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -526,6 +735,10 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if restore_scheduling_base:
+                                request.num_computed_tokens = (
+                                    logical_num_computed_tokens
+                                )
                             break
 
                 # Handles an edge case when P/D Disaggregation
@@ -561,6 +774,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if restore_scheduling_base:
+                        request.num_computed_tokens = logical_num_computed_tokens
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -577,14 +792,19 @@ class Scheduler(SchedulerInterface):
                         request, num_external_computed_tokens
                     )
 
-                # Request was already popped from self.waiting
+                # Request was already popped from the active waiting queue
                 # unless it was re-added above due to new_blocks being None.
-                request = self.waiting.pop_request()
+                request = active_waiting.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
-                    # into the WAITING_FOR_REMOTE_KV state.
-                    skipped_waiting_requests.prepend_request(request)
+                    # into the WAITING_FOR_REMOTE_KV state. It leaves the
+                    # runnable queues until the worker reports load completion.
+                    if restore_scheduling_base:
+                        request.num_computed_tokens = logical_num_computed_tokens
+                    request.remote_kv_origin_interrupt = active_waiting_is_interrupt
+                    request.remote_kv_origin_status = request.status
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    self.remote_kv_loading[request.request_id] = request
                     continue
 
                 req_index += 1
@@ -593,8 +813,17 @@ class Scheduler(SchedulerInterface):
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
-                if request.status == RequestStatus.WAITING:
+                is_new_interrupt_request = (
+                    request.status == RequestStatus.Q_INTERRUPT_WAITING
+                    and request.interrupt_work_kind
+                    == INTERRUPT_WORK_TRUE_ROLLBACK_APPEND
+                    and INTERRUPT_PRIORITY_REQUEST_ID_MARKER in request.request_id
+                    and request.saved_num_computed_tokens == 0
+                )
+                if request.status == RequestStatus.WAITING or is_new_interrupt_request:
                     scheduled_new_reqs.append(request)
+                elif request.status == RequestStatus.Q_INTERRUPT_WAITING:
+                    scheduled_resumed_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -609,6 +838,12 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                request.offloaded_restore_pending = False
+                if request.interrupt_work_kind in {
+                    INTERRUPT_WORK_FALSE_CONTINUE,
+                    INTERRUPT_WORK_TRUE_ROLLBACK_APPEND,
+                }:
+                    self._mark_recovery_protected(request)
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
@@ -630,6 +865,8 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+        if skipped_interrupt_requests:
+            self.interrupt_waiting.prepend_requests(skipped_interrupt_requests)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1253,13 +1490,112 @@ class Scheduler(SchedulerInterface):
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
-        return len(self.running), len(self.waiting)
+        return (
+            len(self.running) + len(self.offloading),
+            len(self.waiting)
+            + len(self.interrupt_waiting)
+            + len(self.remote_kv_loading)
+            + len(self.remote_kv_ready_interrupt),
+        )
 
     def add_request(self, request: Request) -> None:
-        self.waiting.add_request(request)
         self.requests[request.request_id] = request
+        if INTERRUPT_PRIORITY_REQUEST_ID_MARKER in request.request_id:
+            self.enqueue_interrupt_work(request, INTERRUPT_WORK_TRUE_ROLLBACK_APPEND)
+        else:
+            self.waiting.add_request(request)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+
+    def request_interrupt_preempt(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        request = self.requests.get(request_id)
+        if request is None:
+            return {"status": "not_found"}
+        if request.is_finished():
+            return {"status": "already_finished"}
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return {"status": "busy_or_not_interruptible"}
+        if request.status in {
+            RequestStatus.INTERRUPT_PREEMPT_REQUESTED,
+            RequestStatus.OFFLOADING_TO_LMCACHE,
+        }:
+            return {"status": "already_offloading"}
+        if request.status == RequestStatus.PENDING_INTERRUPT_VERDICT:
+            return {"status": "pending_verdict"}
+        if request.status != RequestStatus.RUNNING:
+            return {"status": "busy_or_not_interruptible"}
+
+        request.interrupt_seq = interrupt_seq
+        request.suspend_reason = str((metadata or {}).get("reason", "audio_overlap"))
+        request.saved_num_computed_tokens = request.num_computed_tokens
+        request.saved_output_token_count = request.num_output_tokens
+        request.full_continuation_token_ids = list(request.all_token_ids)
+        request.lmcache_store_token_ids = list(request.all_token_ids)
+        request.lmcache_lookup_token_ids = list(request.all_token_ids)
+        request.offloaded_restore_pending = False
+        request.status = RequestStatus.INTERRUPT_PREEMPT_REQUESTED
+        return {"status": "accepted"}
+
+    def request_interrupt_resume(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+    ) -> dict[str, str]:
+        request = self.pending_verdict.pop(request_id, None)
+        if request is None:
+            request = self.offloading.get(request_id)
+            if request is not None:
+                if request.interrupt_seq != interrupt_seq:
+                    return {"status": "stale_interrupt_seq"}
+                request.interrupt_work_kind = INTERRUPT_WORK_FALSE_CONTINUE
+                return {"status": "accepted"}
+        if request is None:
+            return {"status": "not_found"}
+        if request.interrupt_seq != interrupt_seq:
+            return {"status": "stale_interrupt_seq"}
+        self.enqueue_interrupt_work(request, INTERRUPT_WORK_FALSE_CONTINUE)
+        return {"status": "accepted"}
+
+    def request_interrupt_confirm(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        del rollback_prompt_bytes_b64, metadata
+        request = self.pending_verdict.pop(request_id, None)
+        if request is None:
+            request = self.offloading.get(request_id)
+            if request is not None:
+                if request.interrupt_seq != interrupt_seq:
+                    return {"status": "stale_interrupt_seq"}
+                request.interrupt_work_kind = INTERRUPT_WORK_TRUE_ROLLBACK_APPEND
+                return {"status": "accepted"}
+        if request is None:
+            return {"status": "not_found"}
+        if request.interrupt_seq != interrupt_seq:
+            return {"status": "stale_interrupt_seq"}
+        request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
+        self.finished_req_ids.add(request.request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].add(request.request_id)
+        self.requests.pop(request.request_id, None)
+        return {"status": "accepted"}
+
+    def enqueue_interrupt_work(self, request: Request, work_kind: str) -> None:
+        request.interrupt_work_kind = work_kind
+        request.interrupt_ready_ts = time.monotonic()
+        request.preemptive_admit_eligible = (
+            work_kind == INTERRUPT_WORK_TRUE_ROLLBACK_APPEND
+        )
+        request.status = RequestStatus.Q_INTERRUPT_WAITING
+        self.interrupt_waiting.add_request(request)
 
     def finish_requests(
         self,
@@ -1299,9 +1635,14 @@ class Scheduler(SchedulerInterface):
             self.running = remove_all(self.running, running_requests_to_remove)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
+            self.interrupt_waiting.remove_requests(waiting_requests_to_remove)
+            self.remote_kv_ready_interrupt.remove_requests(waiting_requests_to_remove)
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            self.offloading.pop(request.request_id, None)
+            self.pending_verdict.pop(request.request_id, None)
+            self.remote_kv_loading.pop(request.request_id, None)
             request.status = finished_status
             self._free_request(request)
 
@@ -1326,7 +1667,14 @@ class Scheduler(SchedulerInterface):
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.running)
+        return (
+            len(self.waiting)
+            + len(self.interrupt_waiting)
+            + len(self.remote_kv_ready_interrupt)
+            + len(self.running)
+            + len(self.offloading)
+            + len(self.remote_kv_loading)
+        )
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
@@ -1444,7 +1792,10 @@ class Scheduler(SchedulerInterface):
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
-            if request.num_computed_tokens:
+            if request.offloaded_restore_pending:
+                request.num_computed_tokens = 0
+                self.kv_cache_manager.free(request)
+            elif request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
             else:
@@ -1467,6 +1818,7 @@ class Scheduler(SchedulerInterface):
             # Update the request state for scheduling.
             request.num_computed_tokens = num_computed_tokens
 
+        request.offloaded_restore_pending = False
         # Return that we are ready.
         self.finished_recving_kv_req_ids.remove(request.request_id)
         return True
@@ -1595,14 +1947,9 @@ class Scheduler(SchedulerInterface):
         total_tokens_to_reschedule = 0
 
         # --- Handle async KV loads (WAITING_FOR_REMOTE_KVS) ---
-        async_load_reqs = (
-            req
-            for req in self.waiting
-            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-        )
         async_affected_req_ids, num_tokens_to_reschedule = (
             self._update_requests_with_invalid_blocks(
-                async_load_reqs, invalid_block_ids
+                self.remote_kv_loading.values(), invalid_block_ids
             )
         )
 

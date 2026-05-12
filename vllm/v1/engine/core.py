@@ -298,6 +298,39 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def request_interrupt_preempt(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        return self.scheduler.request_interrupt_preempt(
+            request_id,
+            interrupt_seq,
+            metadata or {},
+        )
+
+    def request_interrupt_resume(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+    ) -> dict[str, str]:
+        return self.scheduler.request_interrupt_resume(request_id, interrupt_seq)
+
+    def request_interrupt_confirm(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        return self.scheduler.request_interrupt_confirm(
+            request_id,
+            interrupt_seq,
+            rollback_prompt_bytes_b64,
+            metadata or {},
+        )
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -907,6 +940,20 @@ class EngineCoreProc(EngineCore):
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
+        elif request_type == EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE:
+            request_id, interrupt_seq, metadata = request
+            self.request_interrupt_preempt(request_id, interrupt_seq, metadata)
+        elif request_type == EngineCoreRequestType.INTERRUPT_RESUME:
+            request_id, interrupt_seq = request
+            self.request_interrupt_resume(request_id, interrupt_seq)
+        elif request_type == EngineCoreRequestType.INTERRUPT_CONFIRM:
+            request_id, interrupt_seq, rollback_prompt_bytes_b64, metadata = request
+            self.request_interrupt_confirm(
+                request_id,
+                interrupt_seq,
+                rollback_prompt_bytes_b64,
+                metadata,
+            )
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)

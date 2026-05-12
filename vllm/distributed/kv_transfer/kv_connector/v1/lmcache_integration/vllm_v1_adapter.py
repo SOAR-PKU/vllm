@@ -647,6 +647,7 @@ class LMCacheConnectorV1Impl:
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
+        self._force_save_requests: dict[str, ReqMeta] = {}
 
         # Whether to discard partial chunks
         self._discard_partial_chunks = (
@@ -1144,11 +1145,12 @@ class LMCacheConnectorV1Impl:
 
         self._requests_priority[request.request_id] = request.priority
 
-        token_ids = request.prompt_token_ids
+        token_override = getattr(request, "lmcache_lookup_token_ids", None)
+        token_ids = token_override if token_override is not None else request.prompt_token_ids
 
         # If the request has multimodal hashes, apply them to the token ids
         mm_hashes, mm_positions = extract_mm_features(request)
-        if mm_hashes and mm_positions:
+        if token_override is None and mm_hashes and mm_positions:
             # TODO(Jiayi): Optimize this
             token_ids_tensor = torch.tensor(request.prompt_token_ids)
             apply_mm_hashes_to_token_ids(token_ids_tensor, mm_hashes, mm_positions)
@@ -1275,6 +1277,58 @@ class LMCacheConnectorV1Impl:
         self.load_specs[request.request_id].can_load = True
 
     @_lmcache_nvtx_annotate
+    def prepare_force_save(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> bool:
+        token_ids = getattr(request, "lmcache_store_token_ids", None)
+        if token_ids is None:
+            token_ids = list(request.all_token_ids)
+        else:
+            token_ids = list(token_ids)
+        computed_tokens = (
+            getattr(request, "saved_num_computed_tokens", 0)
+            or request.num_computed_tokens
+        )
+        max_tokens = min(
+            len(token_ids),
+            computed_tokens,
+            len(block_ids) * self._block_size,
+        )
+        if max_tokens <= 0:
+            return False
+        token_ids = token_ids[:max_tokens]
+
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+        block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
+        slot_mapping = (
+            block_offsets.reshape((1, self._block_size))
+            + block_ids_tensor.reshape((len(block_ids), 1)) * self._block_size
+        )
+        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+        self._force_save_requests[request.request_id] = ReqMeta(
+            req_id=request.request_id,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping,
+            is_last_prefill=False,
+            save_spec=SaveSpec(skip_leading_tokens=0, can_save=True),
+            load_spec=None,
+            disagg_spec=None,
+            request_configs=(
+                extract_request_configs(request.sampling_params)
+                if request.sampling_params
+                else None
+            ),
+        )
+        return True
+
+    def _drain_force_save_requests(self, meta: LMCacheConnectorMetadata) -> None:
+        for req_meta in self._force_save_requests.values():
+            meta.add_request(req_meta)
+        self._force_save_requests.clear()
+
+    @_lmcache_nvtx_annotate
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1295,6 +1349,7 @@ class LMCacheConnectorV1Impl:
         # set and update lookup requests for unpin
         meta.lookup_requests_in_step = self._lookup_requests_in_step
         self._lookup_requests_in_step = []
+        self._drain_force_save_requests(meta)
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)

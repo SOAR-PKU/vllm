@@ -159,6 +159,26 @@ class EngineCoreClient(ABC):
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    def interrupt_preempt_to_lmcache(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
+    def interrupt_resume(self, request_id: str, interrupt_seq: int) -> None:
+        raise NotImplementedError
+
+    def interrupt_confirm(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -223,6 +243,30 @@ class EngineCoreClient(ABC):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    async def interrupt_preempt_to_lmcache_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
+    async def interrupt_resume_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+    ) -> None:
+        raise NotImplementedError
+
+    async def interrupt_confirm_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        raise NotImplementedError
+
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -277,6 +321,31 @@ class InprocClient(EngineCoreClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def interrupt_preempt_to_lmcache(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.engine_core.request_interrupt_preempt(request_id, interrupt_seq, metadata)
+
+    def interrupt_resume(self, request_id: str, interrupt_seq: int) -> None:
+        self.engine_core.request_interrupt_resume(request_id, interrupt_seq)
+
+    def interrupt_confirm(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.engine_core.request_interrupt_confirm(
+            request_id,
+            interrupt_seq,
+            rollback_prompt_bytes_b64,
+            metadata,
+        )
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -745,6 +814,35 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    def interrupt_preempt_to_lmcache(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        self._send_input(
+            EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE,
+            (request_id, interrupt_seq, metadata),
+        )
+
+    def interrupt_resume(self, request_id: str, interrupt_seq: int) -> None:
+        self._send_input(
+            EngineCoreRequestType.INTERRUPT_RESUME,
+            (request_id, interrupt_seq),
+        )
+
+    def interrupt_confirm(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        self._send_input(
+            EngineCoreRequestType.INTERRUPT_CONFIRM,
+            (request_id, interrupt_seq, rollback_prompt_bytes_b64, metadata),
+        )
+
     def profile(self, is_start: bool = True) -> None:
         self.call_utility("profile", is_start)
 
@@ -948,6 +1046,42 @@ class AsyncMPClient(MPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def interrupt_preempt_to_lmcache_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        await self._send_input(
+            EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE,
+            (request_id, interrupt_seq, metadata),
+        )
+        self._ensure_output_queue_task()
+
+    async def interrupt_resume_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+    ) -> None:
+        await self._send_input(
+            EngineCoreRequestType.INTERRUPT_RESUME,
+            (request_id, interrupt_seq),
+        )
+        self._ensure_output_queue_task()
+
+    async def interrupt_confirm_async(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        await self._send_input(
+            EngineCoreRequestType.INTERRUPT_CONFIRM,
+            (request_id, interrupt_seq, rollback_prompt_bytes_b64, metadata),
+        )
+        self._ensure_output_queue_task()
 
     async def profile_async(self, is_start: bool = True) -> None:
         await self.call_utility_async("profile", is_start)

@@ -539,6 +539,44 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
+    async def preempt_to_lmcache(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        """Suspend a running request without aborting its output collector."""
+
+        await self.engine_core.interrupt_preempt_to_lmcache_async(
+            request_id,
+            interrupt_seq,
+            dict(metadata or {}),
+        )
+        return {"status": "accepted"}
+
+    async def resume_from_lmcache(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+    ) -> dict[str, str]:
+        await self.engine_core.interrupt_resume_async(request_id, interrupt_seq)
+        return {"status": "accepted"}
+
+    async def confirm_interrupt(
+        self,
+        request_id: str,
+        interrupt_seq: int,
+        rollback_prompt_bytes_b64: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        await self.engine_core.interrupt_confirm_async(
+            request_id,
+            interrupt_seq,
+            rollback_prompt_bytes_b64,
+            dict(metadata or {}),
+        )
+        return {"status": "accepted"}
+
     async def encode(
         self,
         prompt: PromptType,

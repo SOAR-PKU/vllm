@@ -190,6 +190,16 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.update_state_after_alloc(request, num_external_tokens)
 
+    def prepare_force_save(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> bool:
+        method = getattr(self._lmcache_engine, "prepare_force_save", None)
+        if not callable(method):
+            return False
+        return bool(method(request, block_ids))
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:

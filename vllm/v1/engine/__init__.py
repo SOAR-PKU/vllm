@@ -193,6 +193,9 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY = b"\x03"
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b"\x04"
+    INTERRUPT_PREEMPT_TO_LMCACHE = b"\x05"
+    INTERRUPT_RESUME = b"\x06"
+    INTERRUPT_CONFIRM = b"\x07"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

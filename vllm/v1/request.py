@@ -126,6 +126,26 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # Interrupt offload / reschedule state. These fields are intentionally
+        # scheduler-owned and preserve continuation metadata across LMCache
+        # offload, verdict wait, and resume admission.
+        self.interrupt_seq: int | None = None
+        self.suspend_reason: str | None = None
+        self.interrupt_work_kind: str | None = None
+        self.interrupt_ready_ts: float = 0.0
+        self.preemptive_admit_eligible: bool = False
+        self.recovery_protected_until_step: int = 0
+        self.recovery_protected_until_ts: float = 0.0
+        self.saved_num_computed_tokens: int = 0
+        self.saved_stream_seq: int = 0
+        self.saved_output_token_count: int = 0
+        self.full_continuation_token_ids: list[int] = []
+        self.lmcache_store_token_ids: list[int] | None = None
+        self.lmcache_lookup_token_ids: list[int] | None = None
+        self.offloaded_restore_pending: bool = False
+        self.remote_kv_origin_interrupt: bool = False
+        self.remote_kv_origin_status: "RequestStatus | None" = None
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:
@@ -232,6 +252,12 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_FSM = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
     RUNNING = enum.auto()
+    INTERRUPT_PREEMPT_REQUESTED = enum.auto()
+    OFFLOADING_TO_LMCACHE = enum.auto()
+    PENDING_INTERRUPT_VERDICT = enum.auto()
+    Q_INTERRUPT_WAITING = enum.auto()
+    Q_NORMAL_WAITING = enum.auto()
+    RECOVERY_PROTECTED = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.
@@ -239,6 +265,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_IGNORED = enum.auto()
+    FINISHED_ABORTED_BY_TRUE_INTERRUPT = enum.auto()
 
     def __str__(self):
         return self.name
@@ -260,5 +287,6 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
     RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
+    RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
 }
