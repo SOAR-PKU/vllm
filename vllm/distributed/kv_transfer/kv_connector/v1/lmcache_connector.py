@@ -157,6 +157,24 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         # Fallback for older versions that don't support this method
         return set()
 
+    def should_wait_for_save_on_no_forward(self) -> bool:
+        method = getattr(
+            self._lmcache_engine, "should_wait_for_save_on_no_forward", None
+        )
+        if callable(method):
+            return bool(method())
+        return False
+
+    def take_interrupt_force_save_results(
+        self,
+    ) -> tuple[set[str] | None, dict[str, str] | None]:
+        method = getattr(
+            self._lmcache_engine, "take_interrupt_force_save_results", None
+        )
+        if callable(method):
+            return method()
+        return None, None
+
     # ==============================
     # Scheduler-side methods
     # ==============================

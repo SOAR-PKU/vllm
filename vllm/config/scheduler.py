@@ -150,6 +150,9 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    infersys_interrupt_scheduler_policy: str = ""
+    """Infersys-only interrupt scheduler policy, used for scheduler metrics."""
+
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
             if self.async_scheduling:

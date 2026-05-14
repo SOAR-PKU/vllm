@@ -345,6 +345,24 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def should_wait_for_save_on_no_forward(self) -> bool:
+        """
+        Return whether a no-forward scheduler step still has KV save work that
+        must be completed through wait_for_save().
+        """
+        return False
+
+    def take_interrupt_force_save_results(
+        self,
+    ) -> tuple[set[str] | None, dict[str, str] | None]:
+        """
+        Return and clear interrupt force-save completion/failure results.
+
+        Connectors that do not implement interrupt force-save should leave the
+        default empty result.
+        """
+        return None, None
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

@@ -259,6 +259,20 @@ class MultiConnector(KVConnectorBase_V1):
             agg_block_ids |= c.get_block_ids_with_load_errors()
         return agg_block_ids
 
+    def should_wait_for_save_on_no_forward(self) -> bool:
+        return any(c.should_wait_for_save_on_no_forward() for c in self._connectors)
+
+    def take_interrupt_force_save_results(
+        self,
+    ) -> tuple[set[str] | None, dict[str, str] | None]:
+        finished: set[str] = set()
+        failed: dict[str, str] = {}
+        for c in self._connectors:
+            connector_finished, connector_failed = c.take_interrupt_force_save_results()
+            finished.update(connector_finished or ())
+            failed.update(connector_failed or {})
+        return finished or None, failed or None
+
     # ==============================
     # Scheduler-side methods
     # ==============================

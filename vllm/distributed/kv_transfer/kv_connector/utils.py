@@ -129,6 +129,7 @@ class KVOutputAggregator:
         # [req_id -> n_remaining_workers]
         self._recv_remaining_count = dict[str, int]()
         self._send_remaining_count = dict[str, int]()
+        self._interrupt_force_save_remaining_count = dict[str, int]()
         self._expected_finished_count = expected_finished_count
 
     @classmethod
@@ -159,6 +160,8 @@ class KVOutputAggregator:
 
         finished_sending = set[str]()
         finished_recving = set[str]()
+        interrupt_force_save_finished = set[str]()
+        interrupt_force_save_failed = dict[str, str]()
         kv_transfer_done_timestamps = dict[str, float]()
         aggregated_kv_connector_stats = None
         invalid_block_ids = set[int]()
@@ -185,6 +188,14 @@ class KVOutputAggregator:
             )
             update_finished_set(
                 kv_output.finished_recving, self._recv_remaining_count, finished_recving
+            )
+            update_finished_set(
+                kv_output.interrupt_force_save_finished,
+                self._interrupt_force_save_remaining_count,
+                interrupt_force_save_finished,
+            )
+            interrupt_force_save_failed.update(
+                kv_output.interrupt_force_save_failed or {}
             )
             for req_id, ts in (kv_output.kv_transfer_done_timestamps or {}).items():
                 existing = kv_transfer_done_timestamps.get(req_id)
@@ -215,6 +226,8 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            interrupt_force_save_finished=interrupt_force_save_finished or None,
+            interrupt_force_save_failed=interrupt_force_save_failed or None,
             kv_transfer_done_timestamps=kv_transfer_done_timestamps or None,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             invalid_block_ids=invalid_block_ids,

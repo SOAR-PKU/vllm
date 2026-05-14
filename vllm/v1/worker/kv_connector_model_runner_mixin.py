@@ -79,7 +79,7 @@ class KVConnectorModelRunnerMixin:
         with (
             set_forward_context(None, vllm_config),
             KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, wait_for_save=False
+                scheduler_output, wait_for_save=None
             ) as kv_connector_output,
         ):
             pass
@@ -106,7 +106,7 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     @contextmanager
     def _get_kv_connector_output(
-        scheduler_output: "SchedulerOutput", wait_for_save: bool = True
+        scheduler_output: "SchedulerOutput", wait_for_save: bool | None = True
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
 
@@ -124,9 +124,16 @@ class KVConnectorModelRunnerMixin:
         try:
             yield output
         finally:
-            if wait_for_save:
+            should_wait_for_save = wait_for_save
+            if should_wait_for_save is None:
+                should_wait_for_save = kv_connector.should_wait_for_save_on_no_forward()
+            if should_wait_for_save:
                 kv_connector.wait_for_save()
 
+            (
+                output.interrupt_force_save_finished,
+                output.interrupt_force_save_failed,
+            ) = kv_connector.take_interrupt_force_save_results()
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
             )

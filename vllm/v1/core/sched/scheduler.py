@@ -158,6 +158,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.finished_interrupt_force_save_req_ids: set[str] = set()
+        self.failed_interrupt_force_save_req_ids: dict[str, str] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -217,8 +219,12 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 self.running.append(request)
                 continue
+            request.interrupt_force_save_submitted = True
             request.status = RequestStatus.OFFLOADING_TO_LMCACHE
             self.offloading[request.request_id] = request
+            logger.info(
+                "Interrupt force-save submitted for request %s", request.request_id
+            )
 
     def _prepare_interrupt_force_save(self, request: Request) -> bool:
         if self.connector is None:
@@ -236,9 +242,53 @@ class Scheduler(SchedulerInterface):
     def _complete_interrupt_offloads(self) -> None:
         if not self.offloading:
             return
-        completed = list(self.offloading.values())
-        for request in completed:
-            self.offloading.pop(request.request_id, None)
+        consumed_finished_req_ids: set[str] = set()
+        consumed_failed_req_ids: set[str] = set()
+        for request_id, request in list(self.offloading.items()):
+            if request_id in self.failed_interrupt_force_save_req_ids:
+                error = self.failed_interrupt_force_save_req_ids[request_id]
+                consumed_failed_req_ids.add(request_id)
+                self.offloading.pop(request_id, None)
+                request.interrupt_force_save_failed = True
+                request.interrupt_force_save_error = error
+                request.interrupt_local_kv_retained_after_save_failure = True
+                request.offloaded_restore_pending = False
+                logger.warning(
+                    "Interrupt force-save failed for request %s; retaining "
+                    "local KV. error=%s",
+                    request_id,
+                    error,
+                )
+                if request.interrupt_work_kind == INTERRUPT_WORK_FALSE_CONTINUE:
+                    self.enqueue_interrupt_work(
+                        request, INTERRUPT_WORK_FALSE_CONTINUE
+                    )
+                    continue
+                if (
+                    request.interrupt_work_kind
+                    == INTERRUPT_WORK_TRUE_ROLLBACK_APPEND
+                ):
+                    request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
+                    self._free_request(request)
+                    continue
+                if request.interrupt_work_kind == INTERRUPT_WORK_RECOVERY_EVICTION:
+                    request.status = RequestStatus.RUNNING
+                    self.running.append(request)
+                    continue
+                request.status = RequestStatus.PENDING_INTERRUPT_VERDICT
+                self.pending_verdict[request_id] = request
+                continue
+
+            if request_id not in self.finished_interrupt_force_save_req_ids:
+                logger.debug(
+                    "Interrupt force-save still pending for request %s", request_id
+                )
+                continue
+
+            consumed_finished_req_ids.add(request_id)
+            self.offloading.pop(request_id, None)
+            request.interrupt_force_save_finished = True
+            logger.info("Interrupt force-save finished for request %s", request_id)
             if request.interrupt_work_kind == INTERRUPT_WORK_TRUE_ROLLBACK_APPEND:
                 request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
                 self._free_request(request)
@@ -247,6 +297,10 @@ class Scheduler(SchedulerInterface):
             self.encoder_cache_manager.free(request)
             request.offloaded_restore_pending = True
             if request.interrupt_work_kind == INTERRUPT_WORK_FALSE_CONTINUE:
+                logger.info(
+                    "False interrupt resume will restore request %s from LMCache",
+                    request_id,
+                )
                 self.enqueue_interrupt_work(request, INTERRUPT_WORK_FALSE_CONTINUE)
                 continue
             if request.interrupt_work_kind == INTERRUPT_WORK_RECOVERY_EVICTION:
@@ -256,6 +310,9 @@ class Scheduler(SchedulerInterface):
                 continue
             request.status = RequestStatus.PENDING_INTERRUPT_VERDICT
             self.pending_verdict[request.request_id] = request
+        self.finished_interrupt_force_save_req_ids -= consumed_finished_req_ids
+        for req_id in consumed_failed_req_ids:
+            self.failed_interrupt_force_save_req_ids.pop(req_id, None)
 
     def _promote_finished_remote_kv_loads(self) -> None:
         if not self.remote_kv_loading:
@@ -1538,6 +1595,12 @@ class Scheduler(SchedulerInterface):
         request.lmcache_store_token_ids = list(request.all_token_ids)
         request.lmcache_lookup_token_ids = list(request.all_token_ids)
         request.offloaded_restore_pending = False
+        request.interrupt_force_save_submitted = False
+        request.interrupt_force_save_finished = False
+        request.interrupt_force_save_failed = False
+        request.interrupt_force_save_error = ""
+        request.interrupt_local_kv_retained_after_save_failure = False
+        request.interrupt_work_kind = None
         request.status = RequestStatus.INTERRUPT_PREEMPT_REQUESTED
         return {"status": "accepted"}
 
@@ -1558,6 +1621,21 @@ class Scheduler(SchedulerInterface):
             return {"status": "not_found"}
         if request.interrupt_seq != interrupt_seq:
             return {"status": "stale_interrupt_seq"}
+        if (
+            request.interrupt_force_save_failed
+            and request.interrupt_local_kv_retained_after_save_failure
+        ):
+            request.offloaded_restore_pending = False
+            logger.info(
+                "False interrupt resume for request %s will use retained local KV "
+                "after force-save failure",
+                request_id,
+            )
+        elif request.interrupt_force_save_finished:
+            logger.info(
+                "False interrupt resume for request %s will restore from LMCache",
+                request_id,
+            )
         self.enqueue_interrupt_work(request, INTERRUPT_WORK_FALSE_CONTINUE)
         return {"status": "accepted"}
 
@@ -1581,6 +1659,15 @@ class Scheduler(SchedulerInterface):
             return {"status": "not_found"}
         if request.interrupt_seq != interrupt_seq:
             return {"status": "stale_interrupt_seq"}
+        if request.interrupt_local_kv_retained_after_save_failure:
+            request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
+            self._free_request(request)
+            self.requests.pop(request.request_id, None)
+            logger.info(
+                "True interrupt confirm freed retained local KV for request %s",
+                request_id,
+            )
+            return {"status": "accepted"}
         request.status = RequestStatus.FINISHED_ABORTED_BY_TRUE_INTERRUPT
         self.finished_req_ids.add(request.request_id)
         if self.finished_req_ids_dict is not None:
@@ -1689,18 +1776,30 @@ class Scheduler(SchedulerInterface):
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
+        num_waiting_reqs = len(self.waiting)
+        if self._uses_infersys_lmcache_interrupt_offload():
+            num_waiting_reqs += len(self.interrupt_waiting)
+            num_waiting_reqs += len(self.remote_kv_ready_interrupt)
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
         connector_prefix_cache_stats = self._make_connector_prefix_cache_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
+            num_waiting_reqs=num_waiting_reqs,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
             kv_connector_stats=kv_connector_stats.data if kv_connector_stats else None,
         )
+
+    def _uses_infersys_lmcache_interrupt_offload(self) -> bool:
+        policy = getattr(
+            self.scheduler_config,
+            "infersys_interrupt_scheduler_policy",
+            "",
+        )
+        return str(policy).strip() == "lmcache_offload_v1"
 
     def make_spec_decoding_stats(
         self,
@@ -1841,6 +1940,16 @@ class Scheduler(SchedulerInterface):
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.add(req_id)
+        for req_id in kv_connector_output.interrupt_force_save_finished or ():
+            logger.debug("Finished interrupt force-save for request %s", req_id)
+            self.finished_interrupt_force_save_req_ids.add(req_id)
+        for req_id, error in (
+            kv_connector_output.interrupt_force_save_failed or {}
+        ).items():
+            logger.debug(
+                "Failed interrupt force-save for request %s: %s", req_id, error
+            )
+            self.failed_interrupt_force_save_req_ids[req_id] = error
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests

@@ -255,6 +255,90 @@ class ReqMeta:
     disagg_spec: DisaggSpec | None = None
     # the configs of the request
     request_configs: dict | None = None
+    # Interrupt-only force-save/resume metadata.
+    is_interrupt_force_save: bool = False
+    force_save_full_prefix: bool = False
+    is_interrupt_resume_load: bool = False
+
+    @staticmethod
+    def _unfold_block_ids(
+        block_ids: tuple[list[int], ...] | list[int] | None,
+    ) -> list[int]:
+        if block_ids is None:
+            return []
+        if isinstance(block_ids, tuple):
+            return block_ids[0].copy() if block_ids else []
+        return block_ids.copy()
+
+    @staticmethod
+    def _make_slot_mapping(
+        block_ids: list[int],
+        block_size: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+        block_offsets = torch.arange(0, block_size, dtype=torch.long)
+        slot_mapping = (
+            block_offsets.reshape((1, block_size))
+            + block_ids_tensor.reshape((len(block_ids), 1)) * block_size
+        )
+        return slot_mapping.flatten()[:num_tokens]
+
+    @staticmethod
+    def from_resume_load(
+        *,
+        req_id: str,
+        token_ids: list[int],
+        block_ids: tuple[list[int], ...] | list[int],
+        block_size: int,
+        load_spec: LoadSpec,
+        request_configs: dict | None,
+    ) -> Optional["ReqMeta"]:
+        if not load_spec.can_load:
+            return None
+        if len(token_ids) < load_spec.lmcache_cached_tokens:
+            logger.error(
+                "Cannot build LMCache resume-load metadata for request %s: "
+                "token_ids length %d is smaller than lmcache_cached_tokens %d",
+                req_id,
+                len(token_ids),
+                load_spec.lmcache_cached_tokens,
+            )
+            return None
+
+        unfolded_block_ids = ReqMeta._unfold_block_ids(block_ids)
+        num_required_blocks = cdiv(load_spec.lmcache_cached_tokens, block_size)
+        if len(unfolded_block_ids) < num_required_blocks:
+            logger.error(
+                "Cannot build LMCache resume-load metadata for request %s: "
+                "block count %d is smaller than required blocks %d",
+                req_id,
+                len(unfolded_block_ids),
+                num_required_blocks,
+            )
+            return None
+
+        load_token_ids = token_ids[: load_spec.lmcache_cached_tokens]
+        slot_mapping = ReqMeta._make_slot_mapping(
+            unfolded_block_ids, block_size, len(load_token_ids)
+        )
+        logger.info(
+            "Scheduled LMCache interrupt resume retrieve for request %s: "
+            "lmcache_cached_tokens=%d, vllm_cached_tokens=%d, blocks=%d",
+            req_id,
+            load_spec.lmcache_cached_tokens,
+            load_spec.vllm_cached_tokens,
+            len(unfolded_block_ids),
+        )
+        return ReqMeta(
+            req_id=req_id,
+            token_ids=load_token_ids,
+            slot_mapping=slot_mapping,
+            save_spec=None,
+            load_spec=load_spec,
+            request_configs=request_configs,
+            is_interrupt_resume_load=True,
+        )
 
     @staticmethod
     def from_request_tracker(
@@ -556,6 +640,12 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
         """
         self.requests.append(req_meta)
 
+    def has_interrupt_force_save(self) -> bool:
+        return any(req.is_interrupt_force_save for req in self.requests)
+
+    def interrupt_force_save_req_ids(self) -> set[str]:
+        return {req.req_id for req in self.requests if req.is_interrupt_force_save}
+
 
 class LMCacheConnectorV1Impl:
     def __init__(
@@ -648,6 +738,10 @@ class LMCacheConnectorV1Impl:
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
         self._force_save_requests: dict[str, ReqMeta] = {}
+        self._interrupt_force_save_finished: set[str] = set()
+        self._interrupt_force_save_failed: dict[str, str] = {}
+        self._interrupt_resume_load_req_ids: set[str] = set()
+        self._load_error_block_ids: set[int] = set()
 
         # Whether to discard partial chunks
         self._discard_partial_chunks = (
@@ -876,6 +970,17 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                if request.is_interrupt_resume_load:
+                    logger.info(
+                        "LMCache interrupt resume retrieve for request %s: "
+                        "retrieved=%d, expected=%d, lmcache_cached_tokens=%d, "
+                        "vllm_cached_tokens=%d",
+                        request.req_id,
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                        lmcache_cached_tokens,
+                        request.load_spec.vllm_cached_tokens,
+                    )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "The number of retrieved tokens is less than the "
@@ -885,6 +990,18 @@ class LMCacheConnectorV1Impl:
                         "Num retrieved tokens: %d, num expected tokens: %d",
                         num_retrieved_tokens,
                         num_expected_tokens,
+                    )
+                    failed_slot_mapping = slot_mapping[
+                        request.load_spec.vllm_cached_tokens : lmcache_cached_tokens
+                    ]
+                    failed_block_ids = (
+                        failed_slot_mapping.div(self._block_size, rounding_mode="floor")
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    self._load_error_block_ids.update(
+                        int(block_id) for block_id in failed_block_ids
                     )
 
     @_lmcache_nvtx_annotate
@@ -1023,16 +1140,52 @@ class LMCacheConnectorV1Impl:
             connector_metadata.lookup_requests_in_step
         )
 
+        force_save_req_ids = connector_metadata.interrupt_force_save_req_ids()
+        has_save_requests = any(
+            request.save_spec is not None and request.save_spec.can_save
+            for request in connector_metadata.requests
+        )
+        if not has_save_requests and self.kv_role != "kv_producer":
+            return
+
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
 
         if self.use_layerwise:
+            if force_save_req_ids and not getattr(self, "layerwise_storers", None):
+                error = "layerwise force-save requires a forward save path"
+                for req_id in force_save_req_ids:
+                    self._interrupt_force_save_failed[req_id] = error
+                    logger.error(
+                        "LMCache interrupt force-save failed for request %s: %s",
+                        req_id,
+                        error,
+                    )
+                return
             for layerwise_storer in self.layerwise_storers:
                 next(layerwise_storer)
+            for req_id in force_save_req_ids:
+                self._interrupt_force_save_finished.add(req_id)
+                logger.info(
+                    "LMCache interrupt force-save finished for request %s "
+                    "through layerwise store",
+                    req_id,
+                )
             return
 
-        assert len(self.kv_caches) > 0
+        if len(self.kv_caches) == 0:
+            error = "kv_caches not initialized"
+            for req_id in force_save_req_ids:
+                self._interrupt_force_save_failed[req_id] = error
+                logger.error(
+                    "LMCache interrupt force-save failed for request %s: %s",
+                    req_id,
+                    error,
+                )
+            if force_save_req_ids:
+                return
+            assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
         assert self.lmcache_engine is not None
@@ -1044,71 +1197,117 @@ class LMCacheConnectorV1Impl:
             ) and self.kv_role != "kv_producer":
                 continue
 
-            token_ids = request.token_ids
+            try:
+                token_ids = request.token_ids
 
-            slot_mapping = request.slot_mapping
-            assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
-            assert save_spec is not None
+                slot_mapping = request.slot_mapping
+                assert isinstance(slot_mapping, torch.Tensor)
+                assert len(slot_mapping) == len(token_ids)
+                assert save_spec is not None
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.cuda()
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = slot_mapping.cuda()
 
-            skip_leading_tokens = save_spec.skip_leading_tokens
-            if self.kv_role == "kv_producer":
-                assert request.disagg_spec is not None
-                skip_leading_tokens = min(
-                    skip_leading_tokens, request.disagg_spec.num_transferred_tokens
+                skip_leading_tokens = save_spec.skip_leading_tokens
+                if self.kv_role == "kv_producer":
+                    assert request.disagg_spec is not None
+                    skip_leading_tokens = min(
+                        skip_leading_tokens, request.disagg_spec.num_transferred_tokens
+                    )
+
+                if skip_leading_tokens == len(token_ids):
+                    if request.is_interrupt_force_save:
+                        self._interrupt_force_save_finished.add(request.req_id)
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
                 )
 
-            if skip_leading_tokens == len(token_ids):
-                continue  # skip this request
-            # Align to lmcache chunk size
-            skip_leading_tokens = (
-                skip_leading_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
+                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                store_mask[:skip_leading_tokens] = False
 
-            store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-            store_mask[:skip_leading_tokens] = False
+                force_save_suffix = (
+                    " [interrupt_force_save]" if request.is_interrupt_force_save else ""
+                )
+                logger.info(
+                    "Storing KV cache for %d out of %d tokens "
+                    "(skip_leading_tokens=%d) for request %s%s",
+                    len(token_ids) - skip_leading_tokens,
+                    len(token_ids),
+                    skip_leading_tokens,
+                    request.req_id,
+                    force_save_suffix,
+                )
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
+                is_last_prefill = request.is_last_prefill
+                if is_last_prefill:
+                    if request.disagg_spec:
+                        request.disagg_spec.is_last_prefill = True
+                elif not request.force_save_full_prefix:
+                    token_len = len(token_ids)
+                    aligned_token_len = (
+                        token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
+                    )
+                    token_ids = token_ids[:aligned_token_len]
+                    store_mask = store_mask[:aligned_token_len]
+                    slot_mapping = slot_mapping[:aligned_token_len]
 
-            is_last_prefill = request.is_last_prefill
-            if is_last_prefill:
+                self.lmcache_engine.store(
+                    token_ids,
+                    mask=store_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                    offset=skip_leading_tokens,
+                    transfer_spec=request.disagg_spec,
+                    request_configs=request.request_configs,
+                )
+
+                # NOTE(Jiayi): We assume all tokens are saved
+                save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
-                    request.disagg_spec.is_last_prefill = True
-            else:
-                token_len = len(token_ids)
-                aligned_token_len = (
-                    token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
-                )
-                token_ids = token_ids[:aligned_token_len]
-                store_mask = store_mask[:aligned_token_len]
-                slot_mapping = slot_mapping[:aligned_token_len]
+                    request.disagg_spec.num_transferred_tokens = len(token_ids)
+                if request.is_interrupt_force_save:
+                    self._interrupt_force_save_finished.add(request.req_id)
+                    logger.info(
+                        "LMCache interrupt force-save finished for request %s: "
+                        "tokens=%d",
+                        request.req_id,
+                        len(token_ids),
+                    )
+            except Exception as exc:
+                if request.is_interrupt_force_save:
+                    error = str(exc) or exc.__class__.__name__
+                    self._interrupt_force_save_failed[request.req_id] = error
+                    logger.exception(
+                        "LMCache interrupt force-save failed for request %s",
+                        request.req_id,
+                    )
+                    continue
+                raise
 
-            self.lmcache_engine.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
-                transfer_spec=request.disagg_spec,
-                request_configs=request.request_configs,
-            )
+    def should_wait_for_save_on_no_forward(self) -> bool:
+        metadata = self._parent._get_connector_metadata()
+        return (
+            isinstance(metadata, LMCacheConnectorMetadata)
+            and metadata.has_interrupt_force_save()
+        )
 
-            # NOTE(Jiayi): We assume all tokens are saved
-            save_spec.skip_leading_tokens = len(token_ids)
-            if request.disagg_spec:
-                request.disagg_spec.num_transferred_tokens = len(token_ids)
+    def take_interrupt_force_save_results(
+        self,
+    ) -> tuple[set[str] | None, dict[str, str] | None]:
+        finished = self._interrupt_force_save_finished or None
+        failed = self._interrupt_force_save_failed or None
+        self._interrupt_force_save_finished = set()
+        self._interrupt_force_save_failed = {}
+        return finished, failed
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        block_ids = self._load_error_block_ids
+        self._load_error_block_ids = set()
+        return block_ids
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -1146,7 +1345,9 @@ class LMCacheConnectorV1Impl:
         self._requests_priority[request.request_id] = request.priority
 
         token_override = getattr(request, "lmcache_lookup_token_ids", None)
-        token_ids = token_override if token_override is not None else request.prompt_token_ids
+        token_ids = (
+            token_override if token_override is not None else request.prompt_token_ids
+        )
 
         # If the request has multimodal hashes, apply them to the token ids
         mm_hashes, mm_positions = extract_mm_features(request)
@@ -1252,6 +1453,9 @@ class LMCacheConnectorV1Impl:
             # No KV tokens from external KV cache, return
             return
 
+        if getattr(request, "offloaded_restore_pending", False):
+            self._interrupt_resume_load_req_ids.add(request.request_id)
+
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
@@ -1320,6 +1524,15 @@ class LMCacheConnectorV1Impl:
                 if request.sampling_params
                 else None
             ),
+            is_interrupt_force_save=True,
+            force_save_full_prefix=True,
+        )
+        logger.info(
+            "Prepared LMCache interrupt force-save for request %s: tokens=%d, "
+            "blocks=%d",
+            request.request_id,
+            len(token_ids),
+            len(block_ids),
         )
         return True
 
@@ -1399,6 +1612,19 @@ class LMCacheConnectorV1Impl:
         # changed from list to object `CachedRequestData`
         if isinstance(cached_reqs, list):
             for i, req in enumerate(cached_reqs):
+                is_interrupt_resume_load = (
+                    req.req_id in self._interrupt_resume_load_req_ids
+                )
+                load_spec = None
+                if is_interrupt_resume_load:
+                    self._interrupt_resume_load_req_ids.discard(req.req_id)
+                    load_spec = self.load_specs.pop(req.req_id, None)
+                if load_spec is not None:
+                    self._requests_priority.pop(req.req_id, 0)
+                    raise RuntimeError(
+                        "LMCache resume-load metadata requires CachedRequestData "
+                        f"with full token/block ids for request {req.req_id}"
+                    )
                 request_tracker = self._request_trackers[req.req_id]
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
 
@@ -1414,19 +1640,81 @@ class LMCacheConnectorV1Impl:
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
-            request_tracker = self._request_trackers[req_id]
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if cached_request := self._unfinished_requests.get(req_id):
-                num_current_tokens = len(request_tracker.token_ids)
-                new_token_ids = cached_request.all_token_ids[
-                    num_current_tokens : num_current_tokens + num_new_tokens
-                ]
-            else:
+            cached_request = self._unfinished_requests.get(req_id)
+            if cached_request is None:
                 raise ValueError(
                     f"Request {req_id} is not in _unfinished_requests, "
                     f"but it is scheduled to be cached"
                 )
             new_block_ids = cached_reqs.new_block_ids[i]
+            load_spec = None
+            if req_id in self._interrupt_resume_load_req_ids:
+                self._interrupt_resume_load_req_ids.discard(req_id)
+                load_spec = self.load_specs.pop(req_id, None)
+            if load_spec is not None:
+                request_priority = self._requests_priority.pop(req_id, 0)
+                skip_save = force_skip_save or (
+                    self.config.priority_limit is not None
+                    and request_priority > self.config.priority_limit
+                )
+                all_token_ids = cached_reqs.all_token_ids.get(req_id)
+                if all_token_ids is None:
+                    all_token_ids = list(cached_request.all_token_ids)
+                else:
+                    all_token_ids = list(all_token_ids)
+                num_tokens_to_compute = (
+                    cached_reqs.num_computed_tokens[i] + num_new_tokens
+                )
+                if len(all_token_ids) < num_tokens_to_compute:
+                    raise RuntimeError(
+                        "LMCache resume-load tracker cannot be rebuilt for "
+                        f"request {req_id}: token_ids length {len(all_token_ids)} "
+                        f"is smaller than scheduled tokens {num_tokens_to_compute}"
+                    )
+                unfolded_block_ids = ReqMeta._unfold_block_ids(new_block_ids)
+                request_configs = (
+                    extract_request_configs(cached_request.sampling_params)
+                    if cached_request.sampling_params
+                    else None
+                )
+                request_tracker = RequestTracker(
+                    req_id=req_id,
+                    prompt_len=cached_request.num_prompt_tokens,
+                    token_ids=all_token_ids[:num_tokens_to_compute],
+                    allocated_block_ids=unfolded_block_ids,
+                    num_saved_tokens=(
+                        load_spec.lmcache_cached_tokens if load_spec.can_load else 0
+                    ),
+                    request_configs=request_configs,
+                    skip_save=skip_save,
+                )
+                request_tracker.is_decode_phase = cached_request.num_output_tokens > 0
+                self._request_trackers[req_id] = request_tracker
+                self._unfinished_requests[req_id] = cached_request
+
+                if load_spec.can_load:
+                    req_meta = ReqMeta.from_resume_load(
+                        req_id=req_id,
+                        token_ids=all_token_ids,
+                        block_ids=new_block_ids,
+                        block_size=self._block_size,
+                        load_spec=load_spec,
+                        request_configs=request_configs,
+                    )
+                    if req_meta is None:
+                        raise RuntimeError(
+                            "Failed to build LMCache resume-load metadata for "
+                            f"request {req_id}"
+                        )
+                    meta.add_request(req_meta)
+                continue
+
+            request_tracker = self._request_trackers[req_id]
+            num_current_tokens = len(request_tracker.token_ids)
+            new_token_ids = cached_request.all_token_ids[
+                num_current_tokens : num_current_tokens + num_new_tokens
+            ]
 
             request_tracker.update(new_token_ids, new_block_ids)
 

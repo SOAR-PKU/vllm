@@ -521,6 +521,9 @@ class EngineArgs:
     )
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    infersys_interrupt_scheduler_policy: str = (
+        SchedulerConfig.infersys_interrupt_scheduler_policy
+    )
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     override_pooler_config: dict | PoolerConfig | None = (
@@ -1664,6 +1667,9 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            infersys_interrupt_scheduler_policy=(
+                self.infersys_interrupt_scheduler_policy
+            ),
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

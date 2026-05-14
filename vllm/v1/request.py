@@ -143,6 +143,11 @@ class Request:
         self.lmcache_store_token_ids: list[int] | None = None
         self.lmcache_lookup_token_ids: list[int] | None = None
         self.offloaded_restore_pending: bool = False
+        self.interrupt_force_save_submitted: bool = False
+        self.interrupt_force_save_finished: bool = False
+        self.interrupt_force_save_failed: bool = False
+        self.interrupt_force_save_error: str = ""
+        self.interrupt_local_kv_retained_after_save_failure: bool = False
         self.remote_kv_origin_interrupt: bool = False
         self.remote_kv_origin_status: "RequestStatus | None" = None
 

@@ -1195,6 +1195,13 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         finished_sending, finished_recving = self.get_finished_kv_transfers(
             scheduler_output
         )
+        interrupt_force_save_finished = None
+        interrupt_force_save_failed = None
+        if has_kv_transfer_group():
+            (
+                interrupt_force_save_finished,
+                interrupt_force_save_failed,
+            ) = get_kv_transfer_group().take_interrupt_force_save_results()
 
         selected_token_ids = torch.cat(combined_selected_tokens, dim=0)
         if tpu_sampling_metadata.logprobs:
@@ -1287,10 +1294,17 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         kv_connector_output = (
             None
-            if (finished_sending is None and finished_recving is None)
+            if (
+                finished_sending is None
+                and finished_recving is None
+                and interrupt_force_save_finished is None
+                and interrupt_force_save_failed is None
+            )
             else KVConnectorOutput(
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
+                interrupt_force_save_finished=interrupt_force_save_finished,
+                interrupt_force_save_failed=interrupt_force_save_failed,
             )
         )
 
