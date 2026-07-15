@@ -13,8 +13,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.p2p.base_policy import (
+    KV_TRANSFER_INTENT_QUERY_FULL,
+    TRANSFER_POLICY_BASE,
+    TRANSFER_POLICY_LEGACY_EAGER,
+    VALID_TRANSFER_POLICIES,
+    normalize_transfer_intent,
+    prompt_block_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
+    P2pTransferError,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
@@ -42,8 +51,14 @@ class ReqMeta:
 
     @staticmethod
     def make_meta(
-        request_id: str, token_ids: list[int], block_ids: list[int], block_size: int
+        request_id: str,
+        token_ids: list[int],
+        block_ids: list[int],
+        block_size: int,
+        trim_to_prompt: bool = False,
     ) -> "ReqMeta":
+        if trim_to_prompt and token_ids:
+            block_ids = prompt_block_ids(token_ids, block_ids, block_size)
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
@@ -65,10 +80,24 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         token_ids: list[int],
         block_ids: list[int],
         block_size: int,
+        trim_to_prompt: bool = False,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size)
+            ReqMeta.make_meta(
+                request_id,
+                token_ids,
+                block_ids,
+                block_size,
+                trim_to_prompt=trim_to_prompt,
+            )
         )
+
+
+@dataclass
+class ChunkedPrefillState:
+    block_ids: list[int]
+    prompt_token_ids: list[int] | None
+    transfer_intent: str
 
 
 class P2pNcclConnector(KVConnectorBase_V1):
@@ -86,7 +115,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
-        self.chunked_prefill: dict[str, tuple[list[int], list[int] | None]] = {}
+        self.transfer_policy = self._kv_transfer_config.get_from_extra_config(
+            "transfer_policy", TRANSFER_POLICY_LEGACY_EAGER
+        )
+        if self.transfer_policy not in VALID_TRANSFER_POLICIES:
+            raise ValueError(f"Unsupported P2P transfer policy: {self.transfer_policy}")
+        self.chunked_prefill: dict[str, ChunkedPrefillState] = {}
 
         self._rank = get_world_group().rank if role == KVConnectorRole.WORKER else 0
         self._local_rank = (
@@ -103,6 +137,20 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if role == KVConnectorRole.WORKER
             else None
         )
+
+    @property
+    def is_base_policy(self) -> bool:
+        return self.transfer_policy == TRANSFER_POLICY_BASE
+
+    def _intent_from_params(self, params: dict[str, Any] | None) -> str:
+        return normalize_transfer_intent(self.transfer_policy, params)
+
+    def _intent_from_request(self, request: "Request") -> str:
+        return self._intent_from_params(request.kv_transfer_params)
+
+    def _intent_from_sampling_params(self, sampling_params: Any) -> str:
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        return self._intent_from_params(extra_args.get("kv_transfer_params"))
 
     # ==============================
     # Worker-side methods
@@ -168,6 +216,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if len(block_ids) == num_block:
                     layer[block_ids, ...] = kv_cache
                 else:
+                    if self.is_base_policy:
+                        raise P2pTransferError(
+                            "P2P KV block count mismatch for "
+                            f"request {request_id}: destination={len(block_ids)}, "
+                            f"received={num_block}"
+                        )
                     layer[block_ids[:num_block], ...] = kv_cache
                     logger.warning(
                         "🚧kv_cache does not match, block_ids:%d, "
@@ -183,6 +237,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if len(block_ids) == num_block:
                     layer[:, block_ids, ...] = kv_cache
                 else:
+                    if self.is_base_policy:
+                        raise P2pTransferError(
+                            "P2P KV block count mismatch for "
+                            f"request {request_id}: destination={len(block_ids)}, "
+                            f"received={num_block}"
+                        )
                     layer[:, block_ids[:num_block], ...] = kv_cache
                     logger.warning(
                         "🚧kv_cache does not match, block_ids:%d, "
@@ -221,6 +281,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
 
                 if kv_cache is None:
+                    if self.is_base_policy:
+                        raise P2pTransferError(
+                            "P2P KV transfer returned no data for "
+                            f"request={request.request_id}, layer={layer_name}"
+                        )
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
                     continue
 
@@ -302,9 +367,14 @@ class P2pNcclConnector(KVConnectorBase_V1):
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
-            self.p2p_nccl_engine.send_tensor(
+            accepted = self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
+            if not accepted and self.is_base_policy:
+                raise P2pTransferError(
+                    "P2P peer rejected KV transfer for "
+                    f"request={request_id}, layer={layer_name}"
+                )
 
     def wait_for_save(self):
         if self.is_producer:
@@ -355,6 +425,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if self.is_producer:
             return 0, False
 
+        if (
+            self.is_base_policy
+            and self._intent_from_request(request)
+            != KV_TRANSFER_INTENT_QUERY_FULL
+        ):
+            return 0, False
+
         prompt_token_ids = request.prompt_token_ids or []
         num_external_tokens = len(prompt_token_ids) - 1 - num_computed_tokens
 
@@ -369,7 +446,15 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
-        if not self.is_producer and num_external_tokens > 0:
+        if (
+            not self.is_producer
+            and num_external_tokens > 0
+            and (
+                not self.is_base_policy
+                or self._intent_from_request(request)
+                == KV_TRANSFER_INTENT_QUERY_FULL
+            )
+        ):
             self._requests_need_load[request.request_id] = (
                 request,
                 blocks.get_block_ids()[0],
@@ -392,6 +477,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         for new_req in scheduler_output.scheduled_new_reqs:
             if self.is_producer:
+                transfer_intent = self._intent_from_sampling_params(
+                    new_req.sampling_params
+                )
                 num_scheduled_tokens = (scheduler_output.num_scheduled_tokens)[
                     new_req.req_id
                 ]
@@ -399,18 +487,24 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # the request's prompt is chunked prefill
                 if num_tokens < len(new_req.prompt_token_ids or []):
                     # 'CachedRequestData' has no attribute 'prompt_token_ids'
-                    self.chunked_prefill[new_req.req_id] = (
-                        new_req.block_ids[0],
-                        new_req.prompt_token_ids,
+                    self.chunked_prefill[new_req.req_id] = ChunkedPrefillState(
+                        block_ids=new_req.block_ids[0],
+                        prompt_token_ids=new_req.prompt_token_ids,
+                        transfer_intent=transfer_intent,
                     )
                     continue
                 # the request's prompt is not chunked prefill
-                meta.add_request(
-                    request_id=new_req.req_id,
-                    token_ids=new_req.prompt_token_ids or [],
-                    block_ids=new_req.block_ids[0],
-                    block_size=self._block_size,
-                )
+                if (
+                    not self.is_base_policy
+                    or transfer_intent == KV_TRANSFER_INTENT_QUERY_FULL
+                ):
+                    meta.add_request(
+                        request_id=new_req.req_id,
+                        token_ids=new_req.prompt_token_ids or [],
+                        block_ids=new_req.block_ids[0],
+                        block_size=self._block_size,
+                        trim_to_prompt=self.is_base_policy,
+                    )
                 continue
             if new_req.req_id in self._requests_need_load:
                 meta.add_request(
@@ -418,6 +512,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     token_ids=new_req.prompt_token_ids or [],
                     block_ids=new_req.block_ids[0],
                     block_size=self._block_size,
+                    trim_to_prompt=self.is_base_policy,
                 )
                 self._requests_need_load.pop(new_req.req_id)
 
@@ -431,23 +526,39 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens = num_scheduled_tokens + num_computed_tokens
                 assert req_id in self.chunked_prefill
-                assert new_block_ids is not None
-                block_ids = new_block_ids[0]
-                if not resumed_from_preemption:
-                    block_ids = self.chunked_prefill[req_id][0] + block_ids
-                prompt_token_ids = self.chunked_prefill[req_id][1]
+                chunk_state = self.chunked_prefill[req_id]
+                if new_block_ids is None:
+                    # A chunk can fit entirely in the free slots of the last
+                    # allocated block.  The scheduler then legitimately emits
+                    # no block delta; keep the accumulated block mapping.
+                    assert not resumed_from_preemption
+                    block_ids = list(chunk_state.block_ids)
+                else:
+                    block_ids = new_block_ids[0]
+                if new_block_ids is not None and not resumed_from_preemption:
+                    block_ids = chunk_state.block_ids + block_ids
+                prompt_token_ids = chunk_state.prompt_token_ids
                 assert prompt_token_ids is not None
                 # the request's prompt is chunked prefill again
                 if num_tokens < len(prompt_token_ids):
-                    self.chunked_prefill[req_id] = (block_ids, prompt_token_ids)
+                    self.chunked_prefill[req_id] = ChunkedPrefillState(
+                        block_ids=block_ids,
+                        prompt_token_ids=prompt_token_ids,
+                        transfer_intent=chunk_state.transfer_intent,
+                    )
                     continue
                 # the request's prompt is all prefilled finally
-                meta.add_request(
-                    request_id=req_id,
-                    token_ids=prompt_token_ids,
-                    block_ids=block_ids,
-                    block_size=self._block_size,
-                )
+                if (
+                    not self.is_base_policy
+                    or chunk_state.transfer_intent == KV_TRANSFER_INTENT_QUERY_FULL
+                ):
+                    meta.add_request(
+                        request_id=req_id,
+                        token_ids=prompt_token_ids,
+                        block_ids=block_ids,
+                        block_size=self._block_size,
+                        trim_to_prompt=self.is_base_policy,
+                    )
                 self.chunked_prefill.pop(req_id, None)
                 continue
 
@@ -470,6 +581,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     token_ids=token_ids,
                     block_ids=block_ids,
                     block_size=self._block_size,
+                    trim_to_prompt=self.is_base_policy,
                 )
 
         self._requests_need_load.clear()
@@ -492,6 +604,19 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
 
         self.chunked_prefill.pop(request.request_id, None)
+
+        if (
+            self.is_base_policy
+            and self.is_producer
+            and self._intent_from_request(request) == KV_TRANSFER_INTENT_QUERY_FULL
+            and self._kv_transfer_config.get_from_extra_config(
+                "send_type", "PUT_ASYNC"
+            )
+            == "PUT_ASYNC"
+        ):
+            # Keep source blocks owned by the scheduler until every worker has
+            # observed actual async-send completion via get_finished().
+            return True, None
 
         return False, None
 

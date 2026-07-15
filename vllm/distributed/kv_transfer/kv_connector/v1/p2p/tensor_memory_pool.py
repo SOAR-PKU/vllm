@@ -197,10 +197,33 @@ class TensorMemoryPool:
 
         size = tensor.element_size() * tensor.numel()
         addr = self.allocate(size)
+
+        try:
+            self.store_tensor_at(tensor, addr)
+        except Exception:
+            self.free(addr)
+            raise
+
+        return addr
+
+    def store_tensor_at(self, tensor: torch.Tensor, addr: int) -> None:
+        """Copy a CUDA tensor into a block reserved with :meth:`allocate`.
+
+        P2P receivers use this two-phase API to reserve bounded CPU staging
+        space before acknowledging a transfer. This prevents accepting a NCCL
+        send and only discovering afterwards that the pinned-memory pool is
+        full. The pool remains a plain buddy allocator: callers own the block
+        until they explicitly call :meth:`free`.
+        """
+        if not tensor.is_cuda:
+            raise ValueError("Only CUDA tensors can be stored")
+        if addr not in self.allocated_blocks:
+            raise ValueError("Invalid reserved address")
+
+        size = tensor.element_size() * tensor.numel()
         block = self.allocated_blocks[addr]
 
         if block.size < size:
-            self.free(addr)
             raise ValueError(
                 f"Allocated block size {block.size} is smaller than "
                 f"required size {size}"
@@ -212,12 +235,9 @@ class TensorMemoryPool:
                 buffer, dtype=tensor.dtype, count=tensor.numel()
             ).reshape(tensor.shape)
         except ValueError as err:
-            self.free(addr)
             raise ValueError(f"Failed to create tensor view: {err}") from err
 
         cpu_tensor.copy_(tensor)
-
-        return addr
 
     def load_tensor(
         self,
