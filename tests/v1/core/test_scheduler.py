@@ -1699,6 +1699,134 @@ def test_priority_scheduling_arrival_time_tiebreaker():
     assert scheduled_req_ids == ["1", "2", "0"]
 
 
+def test_priority_waiting_foreground_runs_before_running_media_next_step():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+    )
+    media = create_requests_with_priority(
+        num_requests=1,
+        priorities=[1],
+        arrival_times=[1.0],
+        num_tokens=32,
+        req_ids=["media"],
+    )[0]
+    scheduler.add_request(media)
+
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens == {"media": 8}
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["media"],
+            req_id_to_index={"media": 0},
+            sampled_token_ids=[np.array([])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=8,
+        req_ids=["query"],
+    )[0]
+    scheduler.add_request(query)
+
+    next_output = scheduler.schedule()
+
+    assert [req.req_id for req in next_output.scheduled_new_reqs] == ["query"]
+    assert next_output.num_scheduled_tokens == {"query": 8}
+
+
+def test_priority_running_query_keeps_fcfs_order_over_later_query():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+    )
+    first_query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[1.0],
+        num_tokens=32,
+        req_ids=["query-first"],
+    )[0]
+    scheduler.add_request(first_query)
+
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["query-first"],
+            req_id_to_index={"query-first": 0},
+            sampled_token_ids=[np.array([])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    later_query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=8,
+        req_ids=["query-later"],
+    )[0]
+    scheduler.add_request(later_query)
+
+    next_output = scheduler.schedule()
+
+    assert next_output.num_scheduled_tokens == {"query-first": 8}
+    assert next_output.scheduled_new_reqs == []
+
+
+def test_fcfs_running_request_behavior_is_unchanged():
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+    )
+    media = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["media"],
+    )[0]
+    media.priority = 1
+    scheduler.add_request(media)
+
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["media"],
+            req_id_to_index={"media": 0},
+            sampled_token_ids=[np.array([])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    query = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["query"],
+    )[0]
+    query.priority = 0
+    scheduler.add_request(query)
+
+    next_output = scheduler.schedule()
+
+    assert next_output.num_scheduled_tokens == {"media": 8}
+    assert next_output.scheduled_new_reqs == []
+
+
 def test_priority_scheduling_mixed_priority_and_arrival():
     """Test priority scheduling with mixed priorities and arrival times."""
     scheduler = create_scheduler_with_priority()

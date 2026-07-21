@@ -19,6 +19,10 @@ import zmq
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
+from vllm.kv_transfer_trace import (
+    kv_transfer_trace_enabled,
+    record_kv_transfer_trace,
+)
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -71,6 +75,19 @@ POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+def _kv_trace_core_request(request: Any) -> tuple[str | None, dict[str, Any]]:
+    candidate = request
+    if isinstance(candidate, tuple) and candidate:
+        candidate = candidate[0]
+    request_id = getattr(candidate, "request_id", None)
+    params = getattr(candidate, "kv_transfer_params", None) or {}
+    return request_id, {
+        "do_remote_prefill": bool(params.get("do_remote_prefill")),
+        "do_remote_decode": bool(params.get("do_remote_decode")),
+        "remote_engine_id": params.get("remote_engine_id"),
+    }
 
 
 class EngineCore:
@@ -920,8 +937,39 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        trace_enabled = kv_transfer_trace_enabled()
+        if trace_enabled:
+            step_started_ns = time.monotonic_ns()
+            step_index = getattr(self, "_kv_transfer_trace_step_index", 0)
+            self._kv_transfer_trace_step_index = step_index + 1
+            scheduler_requests = getattr(self.scheduler, "requests", {})
+            request_ids = list(scheduler_requests.keys())[:64]
+            kv_config = self.vllm_config.kv_transfer_config
+            engine_id = None if kv_config is None else kv_config.engine_id
+            record_kv_transfer_trace(
+                "engine_core_step_enter",
+                component="engine_core",
+                engine_id=engine_id,
+                step_index=step_index,
+                request_ids=request_ids,
+                request_count=len(scheduler_requests),
+            )
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
+        model_executed: bool | None = None
+        try:
+            outputs, model_executed = self.step_fn()
+        finally:
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "engine_core_step_exit",
+                    component="engine_core",
+                    engine_id=engine_id,
+                    step_index=step_index,
+                    request_ids=request_ids,
+                    request_count=len(scheduler_requests),
+                    model_executed=model_executed,
+                    duration_ns=time.monotonic_ns() - step_started_ns,
+                )
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -937,7 +985,20 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            trace_request_id, trace_fields = _kv_trace_core_request(req)
+            record_kv_transfer_trace(
+                "engine_core_handle_add_enter",
+                component="engine_core",
+                request_id=trace_request_id,
+                **trace_fields,
+            )
             self.add_request(req, request_wave)
+            record_kv_transfer_trace(
+                "engine_core_handle_add_exit",
+                component="engine_core",
+                request_id=trace_request_id,
+                **trace_fields,
+            )
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE:
@@ -1070,11 +1131,32 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         request = add_request_decoder.decode(data_frames)
                         request = self.preprocess_add_request(request)
+                        trace_request_id, trace_fields = _kv_trace_core_request(request)
+                        record_kv_transfer_trace(
+                            "engine_core_input_decoded",
+                            component="engine_core_input",
+                            request_id=trace_request_id,
+                            **trace_fields,
+                        )
                     else:
                         request = generic_decoder.decode(data_frames)
 
                     # Push to input queue for core busy loop.
+                    if request_type == EngineCoreRequestType.ADD:
+                        record_kv_transfer_trace(
+                            "engine_core_input_queue_put_enter",
+                            component="engine_core_input",
+                            request_id=trace_request_id,
+                            **trace_fields,
+                        )
                     self.input_queue.put_nowait((request_type, request))
+                    if request_type == EngineCoreRequestType.ADD:
+                        record_kv_transfer_trace(
+                            "engine_core_input_queue_put_exit",
+                            component="engine_core_input",
+                            request_id=trace_request_id,
+                            **trace_fields,
+                        )
 
     def process_output_sockets(
         self,

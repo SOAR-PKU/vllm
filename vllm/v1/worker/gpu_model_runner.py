@@ -169,6 +169,8 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+_GLOBAL_MM_ENCODER_GROUPING_CONFIG_KEY = "enable_global_mm_encoder_grouping"
+
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -327,6 +329,23 @@ class GPUModelRunner(
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
+        additional_config = vllm_config.additional_config
+        global_mm_encoder_grouping = (
+            additional_config.get(_GLOBAL_MM_ENCODER_GROUPING_CONFIG_KEY, False)
+            if isinstance(additional_config, dict)
+            else False
+        )
+        if not isinstance(global_mm_encoder_grouping, bool):
+            raise ValueError(
+                f"`{_GLOBAL_MM_ENCODER_GROUPING_CONFIG_KEY}` must be a boolean, "
+                f"but got {global_mm_encoder_grouping!r}."
+            )
+        self.enable_global_mm_encoder_grouping = global_mm_encoder_grouping
+        if self.enable_global_mm_encoder_grouping:
+            logger.info(
+                "Global multi-modal encoder grouping is enabled. Encoder inputs "
+                "will be stably grouped by modality across non-consecutive items."
+            )
 
         if self.model_config.is_encoder_decoder:
             # Maximum length of the encoder input, only for encoder-decoder
@@ -1918,6 +1937,13 @@ class GPUModelRunner(
         if not mm_kwargs:
             return
 
+        if self.enable_global_mm_encoder_grouping:
+            self._execute_mm_encoder_with_global_modality_grouping(
+                mm_kwargs,
+                mm_hashes_pos,
+            )
+            return
+
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
         # we process it separately to preserve item order.
@@ -1985,6 +2011,83 @@ class GPUModelRunner(
             encoder_outputs.extend(curr_group_outputs)
 
         # Cache the encoder outputs by mm_hash
+        for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+            self.encoder_cache[mm_hash] = scatter_mm_placeholders(
+                output,
+                is_embed=pos_info.is_embed,
+            )
+            logger.debug("Finish execute for mm hash %s", mm_hash)
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+    def _execute_mm_encoder_with_global_modality_grouping(
+        self,
+        mm_kwargs: list[MultiModalKwargsItem],
+        mm_hashes_pos: list[tuple[str, PlaceholderRange]],
+    ) -> None:
+        """Batch all scheduled MM items by modality and restore item order."""
+        model = cast(SupportsMultiModal, self.model)
+        indexed_items_by_modality: dict[
+            str, list[tuple[int, MultiModalKwargsItem]]
+        ] = defaultdict(list)
+        for item_index, item in enumerate(mm_kwargs):
+            indexed_items_by_modality[item.modality].append((item_index, item))
+
+        encoder_outputs_by_index: dict[int, torch.Tensor] = {}
+        for modality, indexed_items in indexed_items_by_modality.items():
+            original_indices = [item_index for item_index, _ in indexed_items]
+            items = [item for _, item in indexed_items]
+            grouped_inputs = list(
+                group_mm_kwargs_by_modality(
+                    items,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    merge_by_field_config=model.merge_by_field_config,
+                    multimodal_cpu_fields=model.multimodal_cpu_fields,
+                )
+            )
+            assert len(grouped_inputs) == 1
+            grouped_modality, num_items, mm_kwargs_group = grouped_inputs[0]
+            assert grouped_modality == modality
+            assert num_items == len(original_indices)
+
+            curr_group_outputs = []
+            if (
+                self.is_multimodal_pruning_enabled
+                and modality == "video"
+                and num_items > 1
+            ):
+                for item in items:
+                    _, _, micro_batch_mm_inputs = next(
+                        group_mm_kwargs_by_modality(
+                            [item],
+                            device=self.device,
+                            pin_memory=self.pin_memory,
+                            merge_by_field_config=model.merge_by_field_config,
+                            multimodal_cpu_fields=model.multimodal_cpu_fields,
+                        )
+                    )
+                    micro_batch_outputs = model.embed_multimodal(
+                        **micro_batch_mm_inputs
+                    )
+                    curr_group_outputs.extend(micro_batch_outputs)
+            else:
+                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+
+            sanity_check_mm_encoder_outputs(
+                curr_group_outputs,
+                expected_num_items=num_items,
+            )
+            for item_index, output in zip(original_indices, curr_group_outputs):
+                encoder_outputs_by_index[item_index] = output
+
+        assert len(encoder_outputs_by_index) == len(mm_kwargs)
+        encoder_outputs = [
+            encoder_outputs_by_index[item_index]
+            for item_index in range(len(mm_kwargs))
+        ]
+
+        # Cache outputs in the original item order so mm_hashes_pos remains
+        # aligned with the encoder results.
         for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
             self.encoder_cache[mm_hash] = scatter_mm_placeholders(
                 output,

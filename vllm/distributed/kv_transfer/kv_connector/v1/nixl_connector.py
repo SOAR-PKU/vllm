@@ -44,6 +44,11 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.forward_context import ForwardContext
+from vllm.kv_transfer_trace import (
+    kv_transfer_trace_enabled,
+    kv_transfer_trace_poll_interval_ns,
+    record_kv_transfer_trace,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
@@ -568,12 +573,29 @@ class NixlConnectorScheduler:
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            record_kv_transfer_trace(
+                "nixl_scheduler_build_recv_meta_enter",
+                component="nixl_scheduler",
+                request_id=req_id,
+                engine_id=self.engine_id,
+                local_block_count=len(block_ids),
+                remote_block_count=len(
+                    req.kv_transfer_params.get("remote_block_ids") or []
+                ),
+                remote_engine_id=req.kv_transfer_params.get("remote_engine_id"),
+            )
             meta.add_new_req(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
                 load_remote_cache=True,
                 save_to_host=False,
+            )
+            record_kv_transfer_trace(
+                "nixl_scheduler_build_recv_meta_exit",
+                component="nixl_scheduler",
+                request_id=req_id,
+                engine_id=self.engine_id,
             )
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
@@ -859,6 +881,18 @@ class NixlConnectorWorker:
             self.use_host_buffer = False
         else:
             self.use_host_buffer = self.kv_buffer_device == "cpu"
+        record_kv_transfer_trace(
+            "nixl_worker_initialized",
+            component="nixl_worker",
+            engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
+            world_size=self.world_size,
+            backends=self.nixl_backends,
+            kv_buffer_device=self.kv_buffer_device,
+            use_host_buffer=self.use_host_buffer,
+            ucx_tls=os.environ.get("UCX_TLS"),
+            ucx_net_devices=os.environ.get("UCX_NET_DEVICES"),
+        )
 
         # support for oot platform which can't register nixl memory
         # type based on kv_buffer_device
@@ -903,6 +937,7 @@ class NixlConnectorWorker:
         # [req_id -> list[handle]]
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
         self._recving_transfers = defaultdict[ReqId, list[Transfer]](list)
+        self._trace_poll_by_handle: dict[Any, tuple[int, int, str]] = {}
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -1809,15 +1844,79 @@ class NixlConnectorWorker:
             set of req_ids that have all done xfers
         """
         done_req_ids: set[str] = set()
+        trace_enabled = kv_transfer_trace_enabled()
+        trace_poll_interval_ns = kv_transfer_trace_poll_interval_ns()
         for req_id, handles in list(transfers.items()):
             in_progress = False
             for handle, _xfer_stime in handles:
+                poll_started_ns = time.monotonic_ns()
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                poll_duration_ns = time.monotonic_ns() - poll_started_ns
+                if trace_enabled:
+                    poll_count, last_emit_ns, last_state = (
+                        self._trace_poll_by_handle.get(handle, (0, 0, ""))
+                    )
+                    poll_count += 1
+                    now_ns = time.time_ns()
+                    should_emit = (
+                        poll_count == 1
+                        or xfer_state != last_state
+                        or trace_poll_interval_ns == 0
+                        or now_ns - last_emit_ns >= trace_poll_interval_ns
+                    )
+                    if should_emit:
+                        record_kv_transfer_trace(
+                            "nixl_transfer_poll",
+                            component="nixl_worker",
+                            request_id=req_id,
+                            engine_id=self.engine_id,
+                            tp_rank=self.tp_rank,
+                            handle=str(handle),
+                            state=xfer_state,
+                            poll_count=poll_count,
+                            poll_duration_ns=poll_duration_ns,
+                            handle_lifetime_ns=int(
+                                (time.perf_counter() - _xfer_stime) * 1_000_000_000
+                            ),
+                        )
+                        last_emit_ns = now_ns
+                    self._trace_poll_by_handle[handle] = (
+                        poll_count,
+                        last_emit_ns,
+                        xfer_state,
+                    )
                 if xfer_state == "DONE":
                     # Get telemetry from NIXL
+                    telemetry_started_ns = time.monotonic_ns()
                     res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                    telemetry_duration_ns = time.monotonic_ns() - telemetry_started_ns
+                    if trace_enabled:
+                        poll_count, _, _ = self._trace_poll_by_handle.get(
+                            handle, (0, 0, "")
+                        )
+                        record_kv_transfer_trace(
+                            "nixl_transfer_done",
+                            component="nixl_worker",
+                            request_id=req_id,
+                            engine_id=self.engine_id,
+                            tp_rank=self.tp_rank,
+                            handle=str(handle),
+                            poll_count=poll_count,
+                            telemetry_call_duration_ns=telemetry_duration_ns,
+                            handle_lifetime_ns=int(
+                                (time.perf_counter() - _xfer_stime) * 1_000_000_000
+                            ),
+                            nixl_start_time_us_raw=getattr(res, "startTime", None),
+                            nixl_post_duration_us=getattr(res, "postDuration", None),
+                            nixl_xfer_duration_us=getattr(res, "xferDuration", None),
+                            bytes_transferred=getattr(res, "totalBytes", None),
+                            telemetry_descriptor_count=getattr(
+                                res, "descCount", None
+                            ),
+                        )
                     self.xfer_stats.record_transfer(res)
                     self.nixl_wrapper.release_xfer_handle(handle)
+                    self._trace_poll_by_handle.pop(handle, None)
                 elif xfer_state == "PROC":
                     in_progress = True
                     continue
@@ -1834,10 +1933,30 @@ class NixlConnectorWorker:
                         self._invalid_block_ids.update(meta.local_block_ids)
                     self._recving_metadata.pop(req_id, None)
                     self.nixl_wrapper.release_xfer_handle(handle)
+                    if trace_enabled:
+                        record_kv_transfer_trace(
+                            "nixl_transfer_state_error",
+                            component="nixl_worker",
+                            request_id=req_id,
+                            engine_id=self.engine_id,
+                            tp_rank=self.tp_rank,
+                            handle=str(handle),
+                            state=xfer_state,
+                        )
+                    self._trace_poll_by_handle.pop(handle, None)
                     self.xfer_stats.record_failed_transfer()
             if not in_progress:
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+                if trace_enabled:
+                    record_kv_transfer_trace(
+                        "nixl_request_transfer_complete",
+                        component="nixl_worker",
+                        request_id=req_id,
+                        engine_id=self.engine_id,
+                        tp_rank=self.tp_rank,
+                        handle_count=len(handles),
+                    )
         return done_req_ids
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
@@ -1846,6 +1965,17 @@ class NixlConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
+            record_kv_transfer_trace(
+                "nixl_start_load_enter",
+                component="nixl_worker",
+                request_id=req_id,
+                engine_id=self.engine_id,
+                tp_rank=self.tp_rank,
+                remote_engine_id=meta.remote_engine_id,
+                local_block_count=len(meta.local_block_ids),
+                remote_block_count=len(meta.remote_block_ids),
+                handshake_reused=meta.remote_engine_id in self._remote_agents,
+            )
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
             )
@@ -1872,6 +2002,14 @@ class NixlConnectorWorker:
 
             # Handshake already completed, start async read xfer.
             self._read_blocks_for_req(req_id, meta)
+            record_kv_transfer_trace(
+                "nixl_start_load_exit",
+                component="nixl_worker",
+                request_id=req_id,
+                engine_id=self.engine_id,
+                tp_rank=self.tp_rank,
+                remote_engine_id=remote_engine_id,
+            )
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
@@ -1903,11 +2041,27 @@ class NixlConnectorWorker:
             meta.remote_engine_id,
             req_id,
         )
+        record_kv_transfer_trace(
+            "nixl_read_blocks_for_req_enter",
+            component="nixl_worker",
+            request_id=req_id,
+            engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
+            remote_engine_id=meta.remote_engine_id,
+        )
         self._read_blocks(
             request_id=req_id,
             dst_engine_id=meta.remote_engine_id,
             local_block_ids=meta.local_physical_block_ids,
             remote_block_ids=meta.remote_block_ids,
+        )
+        record_kv_transfer_trace(
+            "nixl_read_blocks_for_req_exit",
+            component="nixl_worker",
+            request_id=req_id,
+            engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
+            remote_engine_id=meta.remote_engine_id,
         )
 
     def _read_blocks(
@@ -1917,6 +2071,18 @@ class NixlConnectorWorker:
         dst_engine_id: str,
         request_id: str,
     ):
+        trace_enabled = kv_transfer_trace_enabled()
+        if trace_enabled:
+            record_kv_transfer_trace(
+                "nixl_read_blocks_enter",
+                component="nixl_worker",
+                request_id=request_id,
+                engine_id=self.engine_id,
+                tp_rank=self.tp_rank,
+                remote_engine_id=dst_engine_id,
+                local_block_count=len(local_block_ids),
+                remote_block_count=len(remote_block_ids),
+            )
         block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(dst_engine_id)
         if block_size_ratio > 1:
             local_block_ids = self.get_mapped_blocks(
@@ -1954,6 +2120,15 @@ class NixlConnectorWorker:
         # just notify P worker that we have the blocks we need.
         num_local_blocks = len(local_block_ids)
         if num_local_blocks == 0:
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_full_prefix_hit_notify",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                )
             remote_rank = self.kv_topo.get_target_remote_rank_from_engine_id(
                 dst_engine_id
             )
@@ -1991,6 +2166,16 @@ class NixlConnectorWorker:
         local_block_descs_ids: np.ndarray
         remote_block_descs_ids: np.ndarray
 
+        if trace_enabled:
+            descriptor_started_ns = time.monotonic_ns()
+            record_kv_transfer_trace(
+                "nixl_descriptor_build_enter",
+                component="nixl_worker",
+                request_id=request_id,
+                engine_id=self.engine_id,
+                tp_rank=self.tp_rank,
+                remote_engine_id=dst_engine_id,
+            )
         if not self.block_window_per_layer:
             # Default case: assume global attention
             remote_block_descs_ids = self._get_block_descs_ids(
@@ -2039,10 +2224,32 @@ class NixlConnectorWorker:
             remote_block_descs_ids = np.concatenate(remote_descs_list)
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        if trace_enabled:
+            record_kv_transfer_trace(
+                "nixl_descriptor_build_exit",
+                component="nixl_worker",
+                request_id=request_id,
+                engine_id=self.engine_id,
+                tp_rank=self.tp_rank,
+                remote_engine_id=dst_engine_id,
+                duration_ns=time.monotonic_ns() - descriptor_started_ns,
+                descriptor_count=len(local_block_descs_ids),
+            )
 
         # Prepare transfer with Nixl.
         handle = None
         try:
+            prepare_started_ns = time.monotonic_ns()
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_prepare_enter",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    descriptor_count=len(local_block_descs_ids),
+                )
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "READ",
                 local_xfer_side_handle,
@@ -2051,13 +2258,67 @@ class NixlConnectorWorker:
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_prepare_exit",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    handle=str(handle),
+                    duration_ns=time.monotonic_ns() - prepare_started_ns,
+                )
 
             # Begin async xfer.
+            post_started_ns = time.monotonic_ns()
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_transfer_call_enter",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    handle=str(handle),
+                )
             self.nixl_wrapper.transfer(handle)
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_transfer_call_exit",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    handle=str(handle),
+                    duration_ns=time.monotonic_ns() - post_started_ns,
+                )
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append((handle, time.perf_counter()))
+            if trace_enabled:
+                self._trace_poll_by_handle[handle] = (0, 0, "")
+                record_kv_transfer_trace(
+                    "nixl_transfer_registered",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    handle=str(handle),
+                )
         except Exception:
+            if trace_enabled:
+                record_kv_transfer_trace(
+                    "nixl_transfer_failed",
+                    component="nixl_worker",
+                    request_id=request_id,
+                    engine_id=self.engine_id,
+                    tp_rank=self.tp_rank,
+                    remote_engine_id=dst_engine_id,
+                    handle=None if handle is None else str(handle),
+                )
             logger.exception(
                 "NIXL transfer setup/initiation failed for request %s. "
                 "Marking blocks as invalid.",

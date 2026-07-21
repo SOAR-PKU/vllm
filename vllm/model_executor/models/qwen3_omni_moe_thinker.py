@@ -112,6 +112,16 @@ except (ImportError, ModuleNotFoundError):
 
 logger = init_logger(__name__)
 
+_MM_ENCODER_FLASH_ATTN_IMPL_CONFIG_KEY = "mm_encoder_flash_attn_impl"
+_MM_ENCODER_FLASH_ATTN_IMPL_AUTO = "auto"
+_MM_ENCODER_FLASH_ATTN_IMPL_VLLM = "vllm"
+_MM_ENCODER_FLASH_ATTN_IMPL_UPSTREAM = "upstream"
+_VALID_MM_ENCODER_FLASH_ATTN_IMPLS = {
+    _MM_ENCODER_FLASH_ATTN_IMPL_AUTO,
+    _MM_ENCODER_FLASH_ATTN_IMPL_VLLM,
+    _MM_ENCODER_FLASH_ATTN_IMPL_UPSTREAM,
+}
+
 
 def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
     input_lengths_leave = input_lengths % 100
@@ -195,6 +205,8 @@ class Qwen3_VisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        attn_backend: AttentionBackendEnum = AttentionBackendEnum.TORCH_SDPA,
+        use_upstream_fa: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -207,6 +219,8 @@ class Qwen3_VisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            attn_backend=attn_backend,
+            use_upstream_fa=use_upstream_fa,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -302,6 +316,7 @@ class Qwen3Omni_VisionTransformer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_backend_override: AttentionBackendEnum | None = None,
+        flash_attn_impl: str = _MM_ENCODER_FLASH_ATTN_IMPL_AUTO,
     ) -> None:
         super().__init__()
         self.hidden_size = vision_config.hidden_size
@@ -334,6 +349,55 @@ class Qwen3Omni_VisionTransformer(nn.Module):
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
+        if (
+            not isinstance(flash_attn_impl, str)
+            or flash_attn_impl not in _VALID_MM_ENCODER_FLASH_ATTN_IMPLS
+        ):
+            valid = ", ".join(sorted(_VALID_MM_ENCODER_FLASH_ATTN_IMPLS))
+            raise ValueError(
+                f"`{_MM_ENCODER_FLASH_ATTN_IMPL_CONFIG_KEY}` must be one of: "
+                f"{valid}"
+            )
+        self.attn_backend = get_vit_attn_backend(
+            head_size=head_dim,
+            dtype=torch.get_default_dtype(),
+            attn_backend_override=attn_backend_override,
+        )
+        use_upstream_fa = False
+        if flash_attn_impl == _MM_ENCODER_FLASH_ATTN_IMPL_UPSTREAM:
+            if self.attn_backend != AttentionBackendEnum.FLASH_ATTN:
+                raise ValueError(
+                    f"`{_MM_ENCODER_FLASH_ATTN_IMPL_CONFIG_KEY}=upstream` "
+                    "requires `mm_encoder_attn_backend=FLASH_ATTN`."
+                )
+            if not check_upstream_fa_availability(torch.get_default_dtype()):
+                raise RuntimeError(
+                    "The Qwen3-Omni image tower was configured to use upstream "
+                    "FlashAttention, but it is unavailable for the current "
+                    "device and dtype."
+                )
+            use_upstream_fa = True
+        elif flash_attn_impl == _MM_ENCODER_FLASH_ATTN_IMPL_VLLM:
+            if self.attn_backend != AttentionBackendEnum.FLASH_ATTN:
+                raise ValueError(
+                    f"`{_MM_ENCODER_FLASH_ATTN_IMPL_CONFIG_KEY}=vllm` "
+                    "requires `mm_encoder_attn_backend=FLASH_ATTN`."
+                )
+        elif (
+            self.attn_backend != AttentionBackendEnum.FLASH_ATTN
+            and check_upstream_fa_availability(torch.get_default_dtype())
+        ):
+            self.attn_backend = AttentionBackendEnum.FLASH_ATTN
+            use_upstream_fa = True
+
+        logger.info(
+            "Qwen3-Omni image tower attention backend=%s, "
+            "flash_attn_impl=%s, use_upstream_fa=%s",
+            self.attn_backend,
+            flash_attn_impl,
+            use_upstream_fa,
+        )
+
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -344,6 +408,8 @@ class Qwen3Omni_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
+                    attn_backend=self.attn_backend,
+                    use_upstream_fa=use_upstream_fa,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -371,17 +437,6 @@ class Qwen3Omni_VisionTransformer(nn.Module):
                     for layer_idx in range(len(self.deepstack_visual_indexes))
                 ]
             )
-
-        self.attn_backend = get_vit_attn_backend(
-            head_size=head_dim,
-            dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
-        )
-        if (
-            self.attn_backend != AttentionBackendEnum.FLASH_ATTN
-            and check_upstream_fa_availability(torch.get_default_dtype())
-        ):
-            self.attn_backend = AttentionBackendEnum.FLASH_ATTN
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1139,12 +1194,22 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             if multimodal_config is not None
             else None
         )
+        additional_config = vllm_config.additional_config
+        flash_attn_impl = (
+            additional_config.get(
+                _MM_ENCODER_FLASH_ATTN_IMPL_CONFIG_KEY,
+                _MM_ENCODER_FLASH_ATTN_IMPL_AUTO,
+            )
+            if isinstance(additional_config, dict)
+            else _MM_ENCODER_FLASH_ATTN_IMPL_AUTO
+        )
         self.visual = Qwen3Omni_VisionTransformer(
             vision_config=thinker_config.vision_config,
             norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "visual"),
             attn_backend_override=attn_backend_override,
+            flash_attn_impl=flash_attn_impl,
         )
         self.quant_config = quant_config
 

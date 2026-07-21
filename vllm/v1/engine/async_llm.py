@@ -17,6 +17,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.utils import _validate_truncation_size
 from vllm.inputs import PromptType
+from vllm.kv_transfer_trace import record_kv_transfer_trace
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
@@ -49,6 +50,21 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+
+def _kv_trace_request_fields(request: EngineCoreRequest) -> dict[str, Any]:
+    # Keep tracing compatible with EngineCoreRequest variants that predate
+    # remote-prefill fields (for example the router's NIXL warm-up request).
+    params = getattr(request, "kv_transfer_params", None) or {}
+    prompt_token_ids = getattr(request, "prompt_token_ids", None)
+    return {
+        "do_remote_prefill": bool(params.get("do_remote_prefill")),
+        "do_remote_decode": bool(params.get("do_remote_decode")),
+        "remote_engine_id": params.get("remote_engine_id"),
+        "prompt_token_count": (
+            0 if prompt_token_ids is None else len(prompt_token_ids)
+        ),
+    }
 
 
 class AsyncLLM(EngineClient):
@@ -272,6 +288,12 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
+        record_kv_transfer_trace(
+            "async_llm_add_request_enter",
+            component="async_llm_frontend",
+            request_id=request_id,
+            prompt_is_engine_core_request=isinstance(prompt, EngineCoreRequest),
+        )
         if self.errored:
             raise EngineDeadError()
 
@@ -289,6 +311,11 @@ class AsyncLLM(EngineClient):
                 "Processor has been moved under OpenAIServing and will "
                 "be removed from AsyncLLM in v0.13."
             )
+            record_kv_transfer_trace(
+                "async_llm_process_inputs_enter",
+                component="async_llm_frontend",
+                request_id=request_id,
+            )
             request = self.processor.process_inputs(
                 request_id,
                 prompt,
@@ -299,6 +326,12 @@ class AsyncLLM(EngineClient):
                 trace_headers,
                 priority,
                 data_parallel_rank,
+            )
+            record_kv_transfer_trace(
+                "async_llm_process_inputs_exit",
+                component="async_llm_frontend",
+                request_id=request_id,
+                **_kv_trace_request_fields(request),
             )
             if isinstance(prompt, str):
                 prompt_text = prompt
@@ -335,10 +368,35 @@ class AsyncLLM(EngineClient):
         queue: RequestOutputCollector,
     ):
         # Add the request to OutputProcessor (this process).
+        trace_fields = _kv_trace_request_fields(request)
+        record_kv_transfer_trace(
+            "async_llm_output_processor_add_enter",
+            component="async_llm_frontend",
+            request_id=request.request_id,
+            **trace_fields,
+        )
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        record_kv_transfer_trace(
+            "async_llm_output_processor_add_exit",
+            component="async_llm_frontend",
+            request_id=request.request_id,
+            **trace_fields,
+        )
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        record_kv_transfer_trace(
+            "async_llm_engine_core_send_enter",
+            component="async_llm_frontend",
+            request_id=request.request_id,
+            **trace_fields,
+        )
         await self.engine_core.add_request_async(request)
+        record_kv_transfer_trace(
+            "async_llm_engine_core_send_exit",
+            component="async_llm_frontend",
+            request_id=request.request_id,
+            **trace_fields,
+        )
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)

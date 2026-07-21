@@ -21,6 +21,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.kv_transfer_trace import (
+    kv_transfer_trace_enabled,
+    record_kv_transfer_trace,
+)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (
@@ -266,6 +270,11 @@ class Scheduler(SchedulerInterface):
             if req_id in self.finished_recving_kv_req_ids
         ]
         for req_id in finished_req_ids:
+            record_kv_transfer_trace(
+                "scheduler_remote_kv_promote_enter",
+                component="scheduler",
+                request_id=req_id,
+            )
             request = self.remote_kv_loading.pop(req_id)
             origin_interrupt = request.remote_kv_origin_interrupt
             origin_status = request.remote_kv_origin_status
@@ -285,6 +294,13 @@ class Scheduler(SchedulerInterface):
                     else RequestStatus.PREEMPTED
                 )
                 self.waiting.add_request(request)
+            record_kv_transfer_trace(
+                "scheduler_remote_kv_promote_exit",
+                component="scheduler",
+                request_id=req_id,
+                num_computed_tokens=request.num_computed_tokens,
+                status=str(request.status),
+            )
 
     def _is_recovery_protected(self, request: Request) -> bool:
         return (
@@ -374,6 +390,7 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        trace_enabled = kv_transfer_trace_enabled()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -395,9 +412,32 @@ class Scheduler(SchedulerInterface):
         self._maybe_start_recovery_preemption_for_interrupt_head()
 
         # First, schedule the RUNNING requests.
+        if self.policy == SchedulingPolicy.PRIORITY:
+            self.running.sort(key=lambda req: (req.priority, req.arrival_time))
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # A newly queued foreground request must get its first scheduling
+            # opportunity before lower-priority running work consumes this
+            # iteration's token budget. Keep the running request resident; the
+            # existing waiting phase below will admit the foreground request.
+            if (
+                self.policy == SchedulingPolicy.PRIORITY
+                and self.waiting
+                and len(self.running) < self.max_num_running_reqs
+            ):
+                waiting_request = self.waiting.peek_request()
+                if (
+                    waiting_request.status
+                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    and (
+                        waiting_request.priority,
+                        waiting_request.arrival_time,
+                    )
+                    < (request.priority, request.arrival_time)
+                ):
+                    break
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -655,11 +695,27 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        if trace_enabled and request.kv_transfer_params is not None:
+                            record_kv_transfer_trace(
+                                "scheduler_external_lookup_enter",
+                                component="scheduler",
+                                request_id=request.request_id,
+                                local_cached_tokens=num_new_local_computed_tokens,
+                            )
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
                             )
                         )
+                        if trace_enabled and request.kv_transfer_params is not None:
+                            record_kv_transfer_trace(
+                                "scheduler_external_lookup_exit",
+                                component="scheduler",
+                                request_id=request.request_id,
+                                local_cached_tokens=num_new_local_computed_tokens,
+                                external_tokens=ext_tokens,
+                                load_kv_async=load_kv_async,
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -762,6 +818,14 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
+                if trace_enabled and load_kv_async:
+                    record_kv_transfer_trace(
+                        "scheduler_allocate_slots_enter",
+                        component="scheduler",
+                        request_id=request.request_id,
+                        external_tokens=num_external_computed_tokens,
+                        local_cached_tokens=num_new_local_computed_tokens,
+                    )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -771,6 +835,18 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
+                if trace_enabled and load_kv_async:
+                    record_kv_transfer_trace(
+                        "scheduler_allocate_slots_exit",
+                        component="scheduler",
+                        request_id=request.request_id,
+                        allocation_succeeded=new_blocks is not None,
+                        new_block_count=(
+                            None
+                            if new_blocks is None
+                            else len(new_blocks.get_block_ids()[0])
+                        ),
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -783,6 +859,12 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    if trace_enabled and load_kv_async:
+                        record_kv_transfer_trace(
+                            "scheduler_connector_update_enter",
+                            component="scheduler",
+                            request_id=request.request_id,
+                        )
                     self.connector.update_state_after_alloc(
                         request,
                         new_computed_blocks + new_blocks,
@@ -791,6 +873,12 @@ class Scheduler(SchedulerInterface):
                     self._update_connector_prefix_cache_stats(
                         request, num_external_computed_tokens
                     )
+                    if trace_enabled and load_kv_async:
+                        record_kv_transfer_trace(
+                            "scheduler_connector_update_exit",
+                            component="scheduler",
+                            request_id=request.request_id,
+                        )
 
                 # Request was already popped from the active waiting queue
                 # unless it was re-added above due to new_blocks being None.
@@ -805,6 +893,14 @@ class Scheduler(SchedulerInterface):
                     request.remote_kv_origin_status = request.status
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     self.remote_kv_loading[request.request_id] = request
+                    if trace_enabled:
+                        record_kv_transfer_trace(
+                            "scheduler_remote_kv_wait_enter",
+                            component="scheduler",
+                            request_id=request.request_id,
+                            external_tokens=num_external_computed_tokens,
+                            local_cached_tokens=num_new_local_computed_tokens,
+                        )
                     continue
 
                 req_index += 1
@@ -812,6 +908,14 @@ class Scheduler(SchedulerInterface):
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+                if trace_enabled and request.kv_transfer_params is not None:
+                    record_kv_transfer_trace(
+                        "scheduler_request_scheduled",
+                        component="scheduler",
+                        request_id=request.request_id,
+                        scheduled_timestamp_s=scheduled_timestamp,
+                        num_new_tokens=num_new_tokens,
                     )
                 is_new_interrupt_request = (
                     request.status == RequestStatus.Q_INTERRUPT_WAITING
@@ -1506,6 +1610,16 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        if request.kv_transfer_params is not None:
+            params = request.kv_transfer_params
+            record_kv_transfer_trace(
+                "scheduler_request_queued",
+                component="scheduler",
+                request_id=request.request_id,
+                do_remote_prefill=bool(params.get("do_remote_prefill")),
+                do_remote_decode=bool(params.get("do_remote_decode")),
+                remote_engine_id=params.get("remote_engine_id"),
+            )
 
     def request_interrupt_preempt(
         self,
@@ -1840,6 +1954,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            record_kv_transfer_trace(
+                "scheduler_finished_recving_observed",
+                component="scheduler",
+                request_id=req_id,
+            )
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
