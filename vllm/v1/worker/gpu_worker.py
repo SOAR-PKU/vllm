@@ -48,7 +48,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import record_function_or_nullcontext, report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
@@ -536,10 +536,17 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with record_function_or_nullcontext("gpu_worker: sample_tokens_batch"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     def execute_model(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput | None:
+        with record_function_or_nullcontext("gpu_worker: execute_model_batch"):
+            return self._execute_model(scheduler_output)
+
+    def _execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | None:
         intermediate_tensors = None

@@ -6,7 +6,7 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
@@ -170,6 +170,18 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 _GLOBAL_MM_ENCODER_GROUPING_CONFIG_KEY = "enable_global_mm_encoder_grouping"
+_MM_ENCODER_FORWARD_SCOPES = {
+    "audio": "gpu_model_runner: mm_encoder.audio_forward",
+    "image": "gpu_model_runner: mm_encoder.image_forward",
+    "video": "gpu_model_runner: mm_encoder.video_forward",
+}
+
+
+def _mm_encoder_forward_scope(modality: str):
+    scope_name = _MM_ENCODER_FORWARD_SCOPES.get(modality)
+    if scope_name is None:
+        return nullcontext()
+    return record_function_or_nullcontext(scope_name)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -1937,6 +1949,14 @@ class GPUModelRunner(
         if not mm_kwargs:
             return
 
+        with record_function_or_nullcontext("gpu_model_runner: mm_encoder"):
+            self._execute_mm_encoder_inputs(mm_kwargs, mm_hashes_pos)
+
+    def _execute_mm_encoder_inputs(
+        self,
+        mm_kwargs: list[MultiModalKwargsItem],
+        mm_hashes_pos: list[tuple[str, PlaceholderRange]],
+    ) -> None:
         if self.enable_global_mm_encoder_grouping:
             self._execute_mm_encoder_with_global_modality_grouping(
                 mm_kwargs,
@@ -1961,7 +1981,6 @@ class GPUModelRunner(
             multimodal_cpu_fields=model.multimodal_cpu_fields,
         ):
             curr_group_outputs = []
-
             # EVS-related change.
             # (ekhvedchenia): Temporary hack to limit peak memory usage when
             # processing multimodal data. This solves the issue with scheduler
@@ -1989,9 +2008,10 @@ class GPUModelRunner(
                         )
                     )
 
-                    micro_batch_outputs = model.embed_multimodal(
-                        **micro_batch_mm_inputs
-                    )
+                    with _mm_encoder_forward_scope(modality):
+                        micro_batch_outputs = model.embed_multimodal(
+                            **micro_batch_mm_inputs
+                        )
 
                     curr_group_outputs.extend(micro_batch_outputs)
             else:
@@ -2002,7 +2022,8 @@ class GPUModelRunner(
                 # 2. A list or tuple (length: num_items) of tensors,
                 # each of shape (feature_size, hidden_size) in case the feature
                 # size is dynamic depending on the input multimodal items.
-                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                with _mm_encoder_forward_scope(modality):
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -2066,12 +2087,14 @@ class GPUModelRunner(
                             multimodal_cpu_fields=model.multimodal_cpu_fields,
                         )
                     )
-                    micro_batch_outputs = model.embed_multimodal(
-                        **micro_batch_mm_inputs
-                    )
+                    with _mm_encoder_forward_scope(modality):
+                        micro_batch_outputs = model.embed_multimodal(
+                            **micro_batch_mm_inputs
+                        )
                     curr_group_outputs.extend(micro_batch_outputs)
             else:
-                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                with _mm_encoder_forward_scope(modality):
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -2438,14 +2461,19 @@ class GPUModelRunner(
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            with record_function_or_nullcontext(
+                "gpu_model_runner: prepare_input_embeddings"
+            ):
+                inputs_embeds_scheduled = self.model.embed_input_ids(
+                    self.input_ids.gpu[:num_scheduled_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
-            # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+                # TODO(woosuk): Avoid the copy. Optimize.
+                self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(
+                    inputs_embeds_scheduled
+                )
 
             input_ids = None
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
@@ -2471,13 +2499,16 @@ class GPUModelRunner(
                 .nonzero(as_tuple=False)
                 .squeeze(1)
             )
-            # Some tokens ids may need to become embeds
-            if token_ids_idx.numel() > 0:
-                token_ids = self.input_ids.gpu[token_ids_idx]
-                tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
-                self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
+            with record_function_or_nullcontext(
+                "gpu_model_runner: prepare_input_embeddings"
+            ):
+                # Some tokens ids may need to become embeds
+                if token_ids_idx.numel() > 0:
+                    token_ids = self.input_ids.gpu[token_ids_idx]
+                    tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+                    self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
-            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+                inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs(num_input_tokens)
             input_ids = None
         else:
@@ -2934,7 +2965,10 @@ class GPUModelRunner(
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: compute_logits"
+                ):
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2953,7 +2987,10 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with record_function_or_nullcontext(
+                        "gpu_model_runner: compute_logits"
+                    ):
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data = {}
                 if logits is not None:
