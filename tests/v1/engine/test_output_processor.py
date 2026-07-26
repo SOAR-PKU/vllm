@@ -25,6 +25,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     FinishReason,
+    LogicalRequestCompletion,
 )
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
@@ -914,6 +915,52 @@ def test_iteration_stats(dummy_test_vectors):
 
     assert iteration_stats.num_prompt_tokens == 0
     assert iteration_stats.num_generation_tokens == num_active
+
+
+def test_logical_completion_does_not_create_execution_metrics(
+    dummy_test_vectors,
+):
+    output_processor = OutputProcessor(
+        dummy_test_vectors.tokenizer,
+        log_stats=True,
+    )
+    request = EngineCoreRequest(
+        request_id="logical-prefill",
+        prompt_token_ids=dummy_test_vectors.prompt_tokens[0],
+        mm_features=None,
+        eos_token_id=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, None)
+    iteration_stats = IterationStats()
+
+    processed = output_processor.process_outputs(
+        [],
+        engine_core_timestamp=time.monotonic(),
+        iteration_stats=iteration_stats,
+        logical_request_completions=[
+            LogicalRequestCompletion(
+                request_id=request.request_id,
+                finish_reason=FinishReason.LENGTH,
+            )
+        ],
+    )
+
+    assert processed.reqs_to_abort == []
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert isinstance(output, RequestOutput)
+    assert output.finished
+    assert output.outputs[0].token_ids == []
+    assert output.metrics is None
+    assert iteration_stats.num_prompt_tokens == 0
+    assert iteration_stats.num_generation_tokens == 0
+    assert not output_processor.has_unfinished_requests()
 
 
 @pytest.mark.parametrize("log_stats", [True, False])

@@ -959,7 +959,11 @@ class AsyncMPClient(MPClient):
                             return
                         await output_handler(_self, outputs)
 
-                    if outputs.outputs or outputs.scheduler_stats:
+                    if (
+                        outputs.outputs
+                        or outputs.scheduler_stats
+                        or outputs.logical_request_completions
+                    ):
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)

@@ -40,6 +40,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.utils.network_utils import (
     get_distributed_init_method,
     get_loopback_ip,
@@ -54,6 +55,12 @@ from vllm.utils.system_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.mm_feature_prefetch import (
+    MM_FEATURE_PREFETCH_CONFIG_KEY,
+    MMFeaturePrefetchAck,
+    MMFeaturePrefetchItem,
+)
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -127,8 +134,37 @@ class MultiprocExecutor(Executor):
         distributed_init_method = get_distributed_init_method(
             get_loopback_ip(), get_open_port()
         )
+        context = get_mp_context()
         self.rpc_broadcast_mq: MessageQueue | None = None
         scheduler_output_handle: Handle | None = None
+        self.mm_feature_prefetch_mq: MessageQueue | None = None
+        mm_feature_prefetch_handle: Handle | None = None
+        self.mm_feature_prefetch_ack_queue: Any | None = None
+        self._mm_feature_prefetch_submit_queue: (
+            queue.Queue[MMFeaturePrefetchItem | None] | None
+        ) = None
+        self._mm_feature_prefetch_sender_thread: Thread | None = None
+
+        mm_config = self.model_config.multimodal_config
+        additional_config = self.vllm_config.additional_config
+        coordinator_enabled = (
+            bool(
+                additional_config.get(
+                    MM_FEATURE_PREFETCH_CONFIG_KEY,
+                    False,
+                )
+            )
+            if isinstance(additional_config, dict)
+            else False
+        )
+        self._mm_feature_prefetch_enabled = (
+            coordinator_enabled
+            and self.parallel_config.nnodes_within_dp == 1
+            and self.parallel_config.node_rank_within_dp == 0
+            and mm_config is not None
+            and mm_config.mm_processor_cache_gb > 0
+            and mm_config.mm_processor_cache_type == "lru"
+        )
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         if self.parallel_config.node_rank_within_dp == 0:
@@ -142,8 +178,21 @@ class MultiprocExecutor(Executor):
                 connect_ip=self.parallel_config.master_addr,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+            if self._mm_feature_prefetch_enabled:
+                self.mm_feature_prefetch_mq = MessageQueue(
+                    self.world_size,
+                    self.local_world_size,
+                    max_chunk_bytes=max_chunk_bytes,
+                    connect_ip=self.parallel_config.master_addr,
+                )
+                mm_feature_prefetch_handle = (
+                    self.mm_feature_prefetch_mq.export_handle()
+                )
+                self.mm_feature_prefetch_ack_queue = context.Queue()
+                self._mm_feature_prefetch_submit_queue = queue.Queue(
+                    maxsize=max(64, self.world_size * 16)
+                )
         # Create workers
-        context = get_mp_context()
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
@@ -160,6 +209,10 @@ class MultiprocExecutor(Executor):
                         rank=global_rank,
                         distributed_init_method=distributed_init_method,
                         input_shm_handle=scheduler_output_handle,
+                        mm_feature_prefetch_handle=mm_feature_prefetch_handle,
+                        mm_feature_prefetch_ack_queue=(
+                            self.mm_feature_prefetch_ack_queue
+                        ),
                         shared_worker_lock=shared_worker_lock,
                     )
                 )
@@ -195,9 +248,12 @@ class MultiprocExecutor(Executor):
             # Wait for all input mqs to be ready.
             if self.rpc_broadcast_mq is not None:
                 self.rpc_broadcast_mq.wait_until_ready()
+            if self.mm_feature_prefetch_mq is not None:
+                self.mm_feature_prefetch_mq.wait_until_ready()
             # Wait for all remote response mqs to be ready.
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
+            self._start_mm_feature_prefetch_sender()
             success = True
         finally:
             if not success:
@@ -249,6 +305,101 @@ class MultiprocExecutor(Executor):
             callback()
         else:
             self.failure_callback = callback
+
+    @property
+    def supports_mm_feature_prefetch(self) -> bool:
+        return self._mm_feature_prefetch_enabled
+
+    def _start_mm_feature_prefetch_sender(self) -> None:
+        submit_queue = self._mm_feature_prefetch_submit_queue
+        if submit_queue is None or self.mm_feature_prefetch_mq is None:
+            return
+
+        def sender_loop() -> None:
+            while not self.shutdown_event.is_set():
+                try:
+                    item = submit_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    return
+                try:
+                    with record_function_or_nullcontext(
+                        "multiproc_executor: mm_feature_prefetch_send"
+                    ):
+                        self.mm_feature_prefetch_mq.enqueue(item, timeout=0.1)
+                except Exception:
+                    logger.warning_once(
+                        "MM feature prefetch data-plane send failed; "
+                        "affected requests will use inline SchedulerOutput data."
+                    )
+                    self._emit_mm_feature_prefetch_failure(item.identifier)
+
+        self._mm_feature_prefetch_sender_thread = Thread(
+            target=sender_loop,
+            daemon=True,
+            name="MMFeaturePrefetchSender",
+        )
+        self._mm_feature_prefetch_sender_thread.start()
+
+    def _emit_mm_feature_prefetch_failure(self, identifier: str) -> None:
+        ack_queue = self.mm_feature_prefetch_ack_queue
+        if ack_queue is None:
+            return
+        for rank in range(self.world_size):
+            try:
+                ack_queue.put_nowait((rank, identifier, False))
+            except (OSError, ValueError):
+                return
+
+    def prefetch_mm_features(
+        self,
+        features: list[MultiModalFeatureSpec],
+    ) -> set[str]:
+        """Queue data-plane sends without waiting for serialization or ACKs."""
+
+        submit_queue = self._mm_feature_prefetch_submit_queue
+        if not self.supports_mm_feature_prefetch or submit_queue is None:
+            return set()
+
+        accepted: set[str] = set()
+        for feature in features:
+            if (
+                feature.data is None
+                or not feature.identifier
+                or feature.identifier in accepted
+            ):
+                continue
+            try:
+                submit_queue.put_nowait(
+                    MMFeaturePrefetchItem(
+                        identifier=feature.identifier,
+                        data=feature.data,
+                    )
+                )
+            except queue.Full:
+                logger.warning_once(
+                    "MM feature prefetch submission queue is full; "
+                    "affected requests will keep inline feature data."
+                )
+                break
+            accepted.add(feature.identifier)
+        return accepted
+
+    def poll_mm_prefetch_acks(self) -> list[MMFeaturePrefetchAck]:
+        ack_queue = self.mm_feature_prefetch_ack_queue
+        if ack_queue is None:
+            return []
+
+        acks: list[MMFeaturePrefetchAck] = []
+        while True:
+            try:
+                acks.append(ack_queue.get_nowait())
+            except queue.Empty:
+                break
+            except (OSError, ValueError):
+                break
+        return acks
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -389,6 +540,19 @@ class MultiprocExecutor(Executor):
         """Properly shut down the executor and its workers"""
         if not getattr(self, "shutting_down", False):
             self.shutting_down = True
+            self.shutdown_event.set()
+
+            submit_queue = getattr(
+                self, "_mm_feature_prefetch_submit_queue", None
+            )
+            if submit_queue is not None:
+                with suppress(queue.Full):
+                    submit_queue.put_nowait(None)
+            sender_thread = getattr(
+                self, "_mm_feature_prefetch_sender_thread", None
+            )
+            if sender_thread is not None:
+                sender_thread.join(timeout=1)
 
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
@@ -400,9 +564,14 @@ class MultiprocExecutor(Executor):
                     w.worker_response_mq = None
                 self._ensure_worker_termination([w.proc for w in workers])
 
-            self.shutdown_event.set()
+            ack_queue = getattr(self, "mm_feature_prefetch_ack_queue", None)
+            if ack_queue is not None:
+                with suppress(OSError, ValueError):
+                    ack_queue.close()
 
         self.rpc_broadcast_mq = None
+        self.mm_feature_prefetch_mq = None
+        self.mm_feature_prefetch_ack_queue = None
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)
@@ -471,12 +640,27 @@ class WorkerProc:
     READY_STR = "READY"
 
     def _init_message_queues(
-        self, input_shm_handle: Handle, vllm_config: VllmConfig
+        self,
+        input_shm_handle: Handle,
+        mm_feature_prefetch_handle: Handle | None,
+        vllm_config: VllmConfig,
     ) -> None:
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Initialize MessageQueue for receiving SchedulerOutput
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
                 input_shm_handle, self.worker.rank
+            )
+            self.mm_feature_prefetch_mq = (
+                MessageQueue.create_from_handle(
+                    mm_feature_prefetch_handle,
+                    self.worker.rank,
+                    # This auxiliary channel runs ahead of formal execution.
+                    # A small polling backoff avoids permanently consuming one
+                    # CPU core per TP rank without entering the critical path.
+                    idle_sleep_s=0.01,
+                )
+                if mm_feature_prefetch_handle is not None
+                else None
             )
 
             # Initializes a message queue for sending the model output
@@ -501,6 +685,7 @@ class WorkerProc:
                     reader_rank_in_group=0
                 )
             )
+            self.mm_feature_prefetch_mq = None
 
     def __init__(
         self,
@@ -509,9 +694,14 @@ class WorkerProc:
         rank: int,
         distributed_init_method: str,
         input_shm_handle: Handle,
+        mm_feature_prefetch_handle: Handle | None,
+        mm_feature_prefetch_ack_queue: Any | None,
         shared_worker_lock: LockType,
     ):
         self.rank = rank
+        self.mm_feature_prefetch_ack_queue = mm_feature_prefetch_ack_queue
+        self._mm_feature_prefetch_shutdown_event = threading.Event()
+        self._mm_feature_prefetch_receiver_thread: Thread | None = None
         wrapper = WorkerWrapperBase(
             vllm_config=vllm_config, rpc_rank=local_rank, global_rank=rank
         )
@@ -551,7 +741,11 @@ class WorkerProc:
         )
 
         # Load model
-        self._init_message_queues(input_shm_handle, vllm_config)
+        self._init_message_queues(
+            input_shm_handle,
+            mm_feature_prefetch_handle,
+            vllm_config,
+        )
         self.worker.load_model()
 
         # Enable environment variable cache (e.g. assume no more
@@ -565,6 +759,8 @@ class WorkerProc:
         rank: int,
         distributed_init_method: str,
         input_shm_handle,  # Receive SchedulerOutput
+        mm_feature_prefetch_handle,
+        mm_feature_prefetch_ack_queue,
         shared_worker_lock: LockType,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
@@ -580,6 +776,8 @@ class WorkerProc:
             "rank": rank,
             "distributed_init_method": distributed_init_method,
             "input_shm_handle": input_shm_handle,
+            "mm_feature_prefetch_handle": mm_feature_prefetch_handle,
+            "mm_feature_prefetch_ack_queue": mm_feature_prefetch_ack_queue,
             "ready_pipe": (reader, writer),
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
@@ -659,11 +857,77 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
+        self._mm_feature_prefetch_shutdown_event.set()
+        if self._mm_feature_prefetch_receiver_thread is not None:
+            self._mm_feature_prefetch_receiver_thread.join(timeout=1)
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
+        self.mm_feature_prefetch_mq = None
+        self.mm_feature_prefetch_ack_queue = None
         self.worker_response_mq = None
         destroy_model_parallel()
         destroy_distributed_environment()
+
+    def start_mm_feature_prefetch_receiver(self) -> None:
+        prefetch_mq = self.mm_feature_prefetch_mq
+        ack_queue = self.mm_feature_prefetch_ack_queue
+        if prefetch_mq is None or ack_queue is None:
+            return
+
+        def receiver_loop() -> None:
+            while not self._mm_feature_prefetch_shutdown_event.is_set():
+                try:
+                    with record_function_or_nullcontext(
+                        "worker: mm_feature_prefetch_receive"
+                    ):
+                        item = prefetch_mq.dequeue(
+                            cancel=self._mm_feature_prefetch_shutdown_event,
+                            indefinite=True,
+                        )
+                except RuntimeError:
+                    if self._mm_feature_prefetch_shutdown_event.is_set():
+                        return
+                    logger.warning_once(
+                        "MM feature prefetch receiver was interrupted; "
+                        "future requests will use inline feature data."
+                    )
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Failed to receive MM feature prefetch data."
+                    )
+                    continue
+
+                success = False
+                identifier = getattr(item, "identifier", "")
+                if isinstance(item, MMFeaturePrefetchItem):
+                    try:
+                        success = self.worker.cache_prefetched_mm_feature(
+                            item.identifier,
+                            item.data,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to cache prefetched MM feature %r.",
+                            item.identifier,
+                        )
+                if not success:
+                    logger.warning_once(
+                        "Worker MM feature prefetch cache rejected an item "
+                        "(invalid item or capacity exhausted); formal "
+                        "execution remains on the inline-data path."
+                    )
+                try:
+                    ack_queue.put_nowait((self.rank, identifier, success))
+                except (OSError, ValueError):
+                    return
+
+        self._mm_feature_prefetch_receiver_thread = Thread(
+            target=receiver_loop,
+            daemon=True,
+            name="MMFeaturePrefetchReceiver",
+        )
+        self._mm_feature_prefetch_receiver_thread.start()
 
     @staticmethod
     def worker_main(*args, **kwargs):
@@ -727,7 +991,10 @@ class WorkerProc:
             # Must be kept consistent with the Executor
             if worker.rpc_broadcast_mq is not None:
                 worker.rpc_broadcast_mq.wait_until_ready()
+            if worker.mm_feature_prefetch_mq is not None:
+                worker.mm_feature_prefetch_mq.wait_until_ready()
             worker.worker_response_mq.wait_until_ready()
+            worker.start_mm_feature_prefetch_receiver()
             ready_writer.close()
             ready_writer = None
 

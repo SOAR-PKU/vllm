@@ -22,6 +22,24 @@ from vllm.v1.serial_utils import UtilityResult
 FINISH_REASON_STRINGS = ("stop", "length", "abort")
 
 
+class PrefillContextMetadata(
+    msgspec.Struct,
+    frozen=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+):
+    """Identity used by the EngineCore streaming-prefill coordinator.
+
+    ``context_lifetime_id`` is the media-context lifetime (called
+    ``generation_id`` by the application), not a text-generation identifier.
+    """
+
+    kind: str
+    router_session_id: int
+    context_lifetime_id: int
+    context_version: int
+    context_role: str = ""
+
+
 class FinishReason(enum.IntEnum):
     """
     Reason a request finished - stop, length, or abort.
@@ -71,6 +89,10 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
+
+    # Optional application metadata. Requests without it follow the unmodified
+    # vLLM admission path.
+    prefill_context: PrefillContextMetadata | None = None
 
 
 class EngineCoreEventType(enum.IntEnum):
@@ -138,6 +160,24 @@ class EngineCoreOutput(
         return self.finish_reason is not None
 
 
+class LogicalRequestCompletion(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """Terminal result for a logical request with no model output.
+
+    Streaming-prefill requests are completed when their cumulative prompt is
+    covered by another physical request.  Keeping this signal separate from
+    ``EngineCoreOutput`` prevents those bookkeeping completions from being
+    counted as model executions or generated tokens.
+    """
+
+    request_id: str
+    finish_reason: FinishReason
+
+
 class UtilityOutput(
     msgspec.Struct,
     array_like=True,  # type: ignore[call-arg]
@@ -168,6 +208,7 @@ class EngineCoreOutputs(
 
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
+    logical_request_completions: list[LogicalRequestCompletion] = []
 
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.

@@ -24,6 +24,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 logger = init_logger(__name__)
 
@@ -204,6 +205,25 @@ class Executor(ABC):
             "execute_model", args=(scheduler_output,), non_block=non_block
         )
         return output[0]
+
+    @property
+    def supports_mm_feature_prefetch(self) -> bool:
+        """Whether this executor has an independent MM feature data plane."""
+
+        return False
+
+    def prefetch_mm_features(
+        self,
+        features: list["MultiModalFeatureSpec"],
+    ) -> set[str]:
+        """Opportunistically enqueue feature data without waiting for workers."""
+
+        return set()
+
+    def poll_mm_prefetch_acks(self) -> list[tuple[int, str, bool]]:
+        """Return currently available worker acknowledgements."""
+
+        return []
 
     @overload
     def sample_tokens(

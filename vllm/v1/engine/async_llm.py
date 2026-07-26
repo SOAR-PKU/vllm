@@ -34,7 +34,7 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.utils.func_utils import deprecate_kwargs
 from vllm.utils.math_utils import cdiv
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreRequest, PrefillContextMetadata
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
@@ -285,6 +285,7 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         prompt_text: str | None = None,
+        prefill_context: "PrefillContextMetadata | None" = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -326,6 +327,7 @@ class AsyncLLM(EngineClient):
                 trace_headers,
                 priority,
                 data_parallel_rank,
+                prefill_context,
             )
             record_kv_transfer_trace(
                 "async_llm_process_inputs_exit",
@@ -418,6 +420,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        prefill_context: "PrefillContextMetadata | None" = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -470,6 +473,7 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
                 prompt_text=prompt_text,
+                prefill_context=prefill_context,
             )
 
             # The output_handler task pushes items into the queue.
@@ -553,7 +557,14 @@ class AsyncLLM(EngineClient):
                     for i, outputs_slice in enumerate(slices):
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
-                            outputs_slice, outputs.timestamp, iteration_stats
+                            outputs_slice,
+                            outputs.timestamp,
+                            iteration_stats,
+                            (
+                                outputs.logical_request_completions
+                                if i == 0
+                                else None
+                            ),
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
@@ -596,6 +607,19 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
+
+    async def retire_streaming_prefill_context(
+        self,
+        router_session_id: int,
+        context_lifetime_id: int,
+    ) -> None:
+        """Permanently retire one streaming media-context lifetime."""
+
+        await self.engine_core.call_utility_async(  # type: ignore[attr-defined]
+            "retire_streaming_prefill_context",
+            router_session_id,
+            context_lifetime_id,
+        )
 
     async def preempt_to_lmcache(
         self,

@@ -18,7 +18,12 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.tracing import SpanAttributes, SpanKind, Tracer, extract_trace_context
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreRequest,
+    FinishReason,
+    LogicalRequestCompletion,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -429,6 +434,9 @@ class OutputProcessor:
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        logical_request_completions: (
+            list[LogicalRequestCompletion] | None
+        ) = None,
     ) -> OutputProcessorOutput:
         """
         Process the EngineCoreOutputs:
@@ -454,6 +462,37 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        for completion in logical_request_completions or ():
+            req_id = completion.request_id
+            req_state = self.request_states.pop(req_id, None)
+            if req_state is None:
+                continue
+
+            # A logical completion is coordinator bookkeeping, not a model
+            # execution.  Finish the original stream without fabricating
+            # timing, token, cache-hit, or tracing metrics.
+            req_state.stats = None
+            if request_output := req_state.make_request_output(
+                new_token_ids=[],
+                pooling_output=(
+                    torch.randn(0, device="cpu")
+                    if req_state.detokenizer is None
+                    else None
+                ),
+                finish_reason=completion.finish_reason,
+                stop_reason=None,
+                kv_transfer_params=None,
+            ):
+                if req_state.queue is not None:
+                    req_state.queue.put(request_output)
+                else:
+                    request_outputs.append(request_output)
+
+            self.lora_states.request_finished(req_id, req_state.lora_name)
+            parent_req = req_state.parent_req
+            if parent_req and not parent_req.child_requests:
+                self.parent_requests.pop(parent_req.request_id, None)
+
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)

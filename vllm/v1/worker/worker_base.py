@@ -14,9 +14,15 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import worker_receiver_cache_from_config
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.serial_utils import run_method
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.mm_feature_prefetch import (
+    MMFeaturePrefetchProtocolError,
+    WorkerMMFeaturePrefetchCache,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -204,6 +210,20 @@ class WorkerWrapperBase:
 
         # `model_config` can be None in tests
         model_config = vllm_config.model_config
+        mm_config = (
+            None if model_config is None else model_config.multimodal_config
+        )
+        self.mm_feature_prefetch_cache = (
+            WorkerMMFeaturePrefetchCache(
+                int(mm_config.mm_processor_cache_gb * GiB_bytes)
+            )
+            if (
+                mm_config is not None
+                and mm_config.mm_processor_cache_gb > 0
+                and mm_config.mm_processor_cache_type == "lru"
+            )
+            else None
+        )
         if model_config and model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils.import_utils import init_cached_hf_modules
@@ -211,6 +231,8 @@ class WorkerWrapperBase:
             init_cached_hf_modules()
 
     def shutdown(self) -> None:
+        if self.mm_feature_prefetch_cache is not None:
+            self.mm_feature_prefetch_cache.clear()
         if self.worker is not None:
             self.worker.shutdown()
 
@@ -346,14 +368,51 @@ class WorkerWrapperBase:
         return getattr(self.worker, attr)
 
     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:
+        prefetched_cache = self.mm_feature_prefetch_cache
+        if prefetched_cache is not None:
+            for req_data in scheduler_output.scheduled_new_reqs:
+                if not any(
+                    feature.data is None
+                    and feature.identifier in prefetched_cache
+                    for feature in req_data.mm_features
+                ):
+                    continue
+                with record_function_or_nullcontext(
+                    "worker: mm_feature_prefetch_materialize"
+                ):
+                    prefetched_cache.materialize_features(
+                        req_data.mm_features
+                    )
+
         mm_cache = self.mm_receiver_cache
-        if mm_cache is None:
-            return
+        if mm_cache is not None:
+            for req_data in scheduler_output.scheduled_new_reqs:
+                req_data.mm_features = mm_cache.get_and_update_features(
+                    req_data.mm_features
+                )
 
         for req_data in scheduler_output.scheduled_new_reqs:
-            req_data.mm_features = mm_cache.get_and_update_features(
-                req_data.mm_features
-            )
+            unresolved = [
+                feature.identifier
+                for feature in req_data.mm_features
+                if feature.data is None
+            ]
+            if unresolved:
+                raise MMFeaturePrefetchProtocolError(
+                    "SchedulerOutput contains unresolved multimodal feature "
+                    "references after both the custom prefetch cache and "
+                    f"native receiver cache were applied: {unresolved!r}"
+                )
+
+    def cache_prefetched_mm_feature(
+        self,
+        identifier: str,
+        data: Any,
+    ) -> bool:
+        """Store one item received by the worker's prefetch thread."""
+
+        cache = self.mm_feature_prefetch_cache
+        return False if cache is None else cache.put(identifier, data)
 
     def execute_model(
         self,
@@ -367,6 +426,9 @@ class WorkerWrapperBase:
         return self.worker.execute_model(scheduler_output, *args, **kwargs)
 
     def reset_mm_cache(self) -> None:
+        if self.mm_feature_prefetch_cache is not None:
+            self.mm_feature_prefetch_cache.clear()
+
         mm_receiver_cache = self.mm_receiver_cache
         if mm_receiver_cache is not None:
             mm_receiver_cache.clear_cache()

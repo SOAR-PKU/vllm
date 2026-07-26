@@ -18,6 +18,7 @@ from vllm.v1.engine import (
     EngineCoreEventType,
     EngineCoreRequest,
     FinishReason,
+    PrefillContextMetadata,
 )
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -44,6 +45,7 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        prefill_context: PrefillContextMetadata | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -110,6 +112,7 @@ class Request:
         self.all_token_ids = ConstantList(self._all_token_ids)
         # trace_headers
         self.trace_headers = trace_headers
+        self.prefill_context = prefill_context
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
@@ -175,6 +178,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            prefill_context=request.prefill_context,
         )
 
     def append_output_token_ids(

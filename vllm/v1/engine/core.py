@@ -55,6 +55,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.prefill_coordinator import StreamingPrefillCoordinator
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -215,6 +216,23 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
+        self.streaming_prefill_coordinator = StreamingPrefillCoordinator(
+            chunk_token_cap=vllm_config.scheduler_config.max_num_batched_tokens,
+            block_size=scheduler_block_size,
+            request_block_hasher=self.request_block_hasher,
+            admit_request=self.scheduler.add_request,
+            feature_prefetch_world_size=(
+                vllm_config.parallel_config.world_size
+                if self.model_executor.supports_mm_feature_prefetch
+                else 0
+            ),
+            prefetch_mm_features=(
+                self.model_executor.prefetch_mm_features
+                if self.model_executor.supports_mm_feature_prefetch
+                else None
+            ),
+        )
+
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
@@ -281,6 +299,8 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        self._poll_mm_feature_prefetch_acks()
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -306,7 +326,15 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        coordinator = self.streaming_prefill_coordinator
+        if coordinator.handles_streaming(request):
+            coordinator.add_streaming(request)
+            self._poll_mm_feature_prefetch_acks()
+            return
+        if coordinator.observes_query(request):
+            coordinator.observe_query(request)
         self.scheduler.add_request(request)
+        self._poll_mm_feature_prefetch_acks()
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -314,7 +342,20 @@ class EngineCore:
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
-        self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        physical_request_ids = self.streaming_prefill_coordinator.abort(
+            request_ids
+        )
+        scheduler_request_ids = [
+            request_id
+            for request_id in request_ids
+            if request_id in self.scheduler.requests  # type: ignore[attr-defined]
+        ]
+        scheduler_request_ids.extend(physical_request_ids)
+        if scheduler_request_ids:
+            self.scheduler.finish_requests(
+                scheduler_request_ids,
+                RequestStatus.FINISHED_ABORTED,
+            )
 
     def request_interrupt_preempt(
         self,
@@ -386,6 +427,7 @@ class EngineCore:
             return self._step()
 
     def _step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        self._poll_mm_feature_prefetch_acks()
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -406,8 +448,18 @@ class EngineCore:
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
+        self._poll_mm_feature_prefetch_acks()
+        self.streaming_prefill_coordinator.update_after_step(
+            scheduler_output,
+            engine_core_outputs,
+        )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _poll_mm_feature_prefetch_acks(self) -> None:
+        acks = self.model_executor.poll_mm_prefetch_acks()
+        if acks:
+            self.streaming_prefill_coordinator.update_mm_prefetch_acks(acks)
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -441,6 +493,7 @@ class EngineCore:
     def _step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        self._poll_mm_feature_prefetch_acks()
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -512,6 +565,11 @@ class EngineCore:
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
+        self._poll_mm_feature_prefetch_acks()
+        self.streaming_prefill_coordinator.update_after_step(
+            scheduler_output,
+            engine_core_outputs,
+        )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -554,9 +612,29 @@ class EngineCore:
             self.mm_receiver_cache.clear_cache()
 
         self.model_executor.reset_mm_cache()
+        self.streaming_prefill_coordinator.reset_mm_prefetch_state()
 
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
+
+    def retire_streaming_prefill_context(
+        self,
+        router_session_id: int,
+        context_lifetime_id: int,
+    ) -> None:
+        """Retire one application media-context lifetime idempotently."""
+
+        physical_request_ids = (
+            self.streaming_prefill_coordinator.retire_context(
+                router_session_id,
+                context_lifetime_id,
+            )
+        )
+        if physical_request_ids:
+            self.scheduler.finish_requests(
+                physical_request_ids,
+                RequestStatus.FINISHED_ABORTED,
+            )
 
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
@@ -1019,6 +1097,11 @@ class EngineCoreProc(EngineCore):
                 **trace_fields,
             )
             self.add_request(req, request_wave)
+            pending = (
+                self.streaming_prefill_coordinator.take_pending_outputs()
+            )
+            for output in pending.items():
+                self.output_queue.put_nowait(output)
             record_kv_transfer_trace(
                 "engine_core_handle_add_exit",
                 component="engine_core",
@@ -1027,6 +1110,11 @@ class EngineCoreProc(EngineCore):
             )
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
+            pending = (
+                self.streaming_prefill_coordinator.take_pending_outputs()
+            )
+            for pending_output in pending.items():
+                self.output_queue.put_nowait(pending_output)
         elif request_type == EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE:
             request_id, interrupt_seq, metadata = request
             self.request_interrupt_preempt(request_id, interrupt_seq, metadata)
@@ -1056,6 +1144,11 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=output))
             )
+            pending = (
+                self.streaming_prefill_coordinator.take_pending_outputs()
+            )
+            for pending_output in pending.items():
+                self.output_queue.put_nowait(pending_output)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
             raise RuntimeError("Executor failed.")
         else:

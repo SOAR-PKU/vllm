@@ -328,7 +328,14 @@ class MessageQueue:
         return self.handle
 
     @staticmethod
-    def create_from_handle(handle: Handle, rank) -> "MessageQueue":
+    def create_from_handle(
+        handle: Handle,
+        rank,
+        *,
+        idle_sleep_s: float | None = None,
+    ) -> "MessageQueue":
+        if idle_sleep_s is not None and idle_sleep_s <= 0:
+            raise ValueError("idle_sleep_s must be positive when provided")
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
@@ -351,9 +358,19 @@ class MessageQueue:
 
             self.remote_socket = None
 
-            self._read_spin_timer = (
-                SpinSleepTimer() if envs.VLLM_SLEEP_WHEN_IDLE else SpinTimer()
-            )
+            if idle_sleep_s is not None:
+                # Auxiliary/background channels do not need the low-latency
+                # busy polling used by the model-execution data plane.
+                self._read_spin_timer = SpinSleepTimer(
+                    busy_loop_s=0.0,
+                    wait_sleep_s=idle_sleep_s,
+                )
+            else:
+                self._read_spin_timer = (
+                    SpinSleepTimer()
+                    if envs.VLLM_SLEEP_WHEN_IDLE
+                    else SpinTimer()
+                )
         else:
             self.buffer = None  # type: ignore
             self.current_idx = -1
