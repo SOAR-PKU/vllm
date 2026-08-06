@@ -3,7 +3,9 @@
 
 import enum
 import time
+from bisect import bisect_right
 from collections.abc import Callable, Mapping
+from copy import copy
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -46,6 +48,7 @@ class Request:
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         prefill_context: PrefillContextMetadata | None = None,
+        copy_prompt_token_ids_to_all: bool = True,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -90,11 +93,19 @@ class Request:
             prompt_token_ids, prompt_embeds
         )
         self._output_token_ids: list[int] = []
-        self._all_token_ids: list[int] = (
-            self.prompt_token_ids.copy()
-            if self.prompt_token_ids is not None
-            else [0] * self.num_prompt_tokens
-        )
+        if self.prompt_token_ids is None:
+            self._all_token_ids = [0] * self.num_prompt_tokens
+            self._all_token_ids_shares_prompt = False
+        elif copy_prompt_token_ids_to_all:
+            self._all_token_ids = self.prompt_token_ids.copy()
+            self._all_token_ids_shares_prompt = False
+        else:
+            # Streaming logical Requests are immutable coordinator inputs.
+            # Sharing avoids one full cumulative-prefix copy. If such a
+            # Request is scheduled by the direct baseline, the first generated
+            # token detaches this list before mutation.
+            self._all_token_ids = self.prompt_token_ids
+            self._all_token_ids_shares_prompt = True
         self.num_output_placeholders = 0  # Used in async scheduling.
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
@@ -149,6 +160,7 @@ class Request:
         self.remote_kv_origin_interrupt: bool = False
         self.remote_kv_origin_status: "RequestStatus | None" = None
 
+        self._block_hasher = block_hasher
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:
@@ -179,12 +191,152 @@ class Request:
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             prefill_context=request.prefill_context,
+            copy_prompt_token_ids_to_all=not (
+                request.prefill_context is not None
+                and request.prefill_context.kind == "streaming"
+            ),
+        )
+
+    @classmethod
+    def from_request_prefix(
+        cls,
+        source: "Request",
+        *,
+        request_id: str,
+        target_num_prompt_tokens: int,
+        block_size: int,
+        sampling_params: SamplingParams | None,
+        pooling_params: PoolingParams | None = None,
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        prefill_context: PrefillContextMetadata | None = None,
+        mm_features_are_validated_prefix: bool = False,
+    ) -> "Request":
+        """Create an independently mutable request for a prompt prefix.
+
+        The returned request reuses the source request's hashes for complete
+        prompt blocks. It still owns separate prompt/all-token lists and a
+        separate block-hash list because generated tokens may extend both
+        ``_all_token_ids`` and ``block_hashes``.
+
+        This factory is intended for internal requests derived from an already
+        validated prefix of ``source``. It rejects targets that split a
+        multimodal placeholder and validates any caller-prepared feature list
+        using only the fields that affect prefix identity.
+        """
+
+        prompt_token_ids = source.prompt_token_ids
+        if prompt_token_ids is None or source.prompt_embeds is not None:
+            raise ValueError(
+                "Request prefix reuse requires prompt token IDs without "
+                "prompt embeddings"
+            )
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if not 0 < target_num_prompt_tokens <= source.num_prompt_tokens:
+            raise ValueError(
+                f"target_num_prompt_tokens must be in [1, {source.num_prompt_tokens}]"
+            )
+
+        prefix_feature_count = bisect_right(
+            source.mm_features,
+            target_num_prompt_tokens,
+            key=lambda feature: (
+                feature.mm_position.offset + feature.mm_position.length
+            ),
+        )
+        if prefix_feature_count < len(source.mm_features):
+            next_feature = source.mm_features[prefix_feature_count]
+            position = next_feature.mm_position
+            if (
+                position.offset
+                < target_num_prompt_tokens
+                < position.offset + position.length
+            ):
+                raise ValueError(
+                    "target_num_prompt_tokens cannot split a multimodal "
+                    f"feature: identifier={next_feature.identifier!r}, "
+                    f"offset={position.offset}, length={position.length}"
+                )
+
+        if mm_features is None:
+            source_prefix_features = source.mm_features[
+                :prefix_feature_count
+            ]
+            prefix_features = [copy(feature) for feature in source_prefix_features]
+        elif mm_features_are_validated_prefix:
+            prefix_features = mm_features
+        else:
+            source_prefix_features = source.mm_features[
+                :prefix_feature_count
+            ]
+            prefix_features = mm_features
+            expected_identity = cls._mm_feature_identity(source_prefix_features)
+            actual_identity = cls._mm_feature_identity(prefix_features)
+            if actual_identity != expected_identity:
+                raise ValueError(
+                    "mm_features must preserve the source prefix's modality, "
+                    "identifier, offset, length, and order"
+                )
+
+        prefix_request = cls(
+            request_id=request_id,
+            client_index=source.client_index,
+            prompt_token_ids=prompt_token_ids[:target_num_prompt_tokens],
+            prompt_embeds=None,
+            mm_features=prefix_features,
+            sampling_params=sampling_params,
+            pooling_params=pooling_params,
+            eos_token_id=source.eos_token_id,
+            arrival_time=source.arrival_time,
+            lora_request=source.lora_request,
+            cache_salt=source.cache_salt,
+            priority=source.priority,
+            trace_headers=source.trace_headers,
+            block_hasher=None,
+            prefill_context=prefill_context,
+            copy_prompt_token_ids_to_all=False,
+        )
+
+        block_hasher = source._block_hasher
+        if block_hasher is None:
+            return prefix_request
+
+        expected_source_blocks = source.num_tokens // block_size
+        if len(source.block_hashes) != expected_source_blocks:
+            raise ValueError(
+                "block_size does not match the source request's block-hash "
+                f"state: expected={expected_source_blocks}, "
+                f"available={len(source.block_hashes)}"
+            )
+
+        num_full_blocks = target_num_prompt_tokens // block_size
+        prefix_request._block_hasher = block_hasher
+        prefix_request.block_hashes = source.block_hashes[:num_full_blocks]
+        prefix_request.get_hash_new_full_blocks = partial(block_hasher, prefix_request)
+        return prefix_request
+
+    @staticmethod
+    def _mm_feature_identity(
+        features: list[MultiModalFeatureSpec],
+    ) -> tuple[tuple[str, str, int, int], ...]:
+        return tuple(
+            (
+                feature.modality,
+                feature.identifier,
+                feature.mm_position.offset,
+                feature.mm_position.length,
+            )
+            for feature in features
         )
 
     def append_output_token_ids(
         self,
         token_ids: int | list[int],
     ) -> None:
+        if self._all_token_ids_shares_prompt:
+            self._all_token_ids = self._all_token_ids.copy()
+            self.all_token_ids = ConstantList(self._all_token_ids)
+            self._all_token_ids_shares_prompt = False
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)

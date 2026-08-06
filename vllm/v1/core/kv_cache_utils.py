@@ -387,9 +387,11 @@ def _gen_mm_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[list[Any], int]:
     """Generate extra keys related to MultiModal request for block hash
-    computation. For multi-modal inputs, the extra keys are
-    (mm_hash, start_offset) that indicate a mm input contained in the
-    block and its starting offset in the block tokens.
+    computation. For multi-modal inputs, each extra key is the complete
+    feature descriptor ``(identifier, modality, offset, length)``. Including
+    the placement and modality prevents distinct multimodal prompt layouts
+    from sharing a prefix-cache block merely because their identifiers and
+    token IDs happen to match.
 
     Args:
         request: The request object.
@@ -431,7 +433,14 @@ def _gen_mm_extra_hash_keys(
                 continue
 
             # The block contains the current mm input.
-            extra_keys.append(mm_feature.identifier)
+            extra_keys.append(
+                (
+                    mm_feature.identifier,
+                    mm_feature.modality,
+                    offset,
+                    length,
+                )
+            )
 
             if end_token_idx >= offset + length:
                 # If this block contains the end of the current mm input,

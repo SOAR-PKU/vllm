@@ -40,7 +40,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
-from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.utils.network_utils import (
     get_distributed_init_method,
     get_loopback_ip,
@@ -60,10 +59,13 @@ from vllm.v1.worker.mm_feature_prefetch import (
     MM_FEATURE_PREFETCH_CONFIG_KEY,
     MMFeaturePrefetchAck,
     MMFeaturePrefetchItem,
+    MMFeaturePrefetchRelease,
 )
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+_MM_FEATURE_PREFETCH_WORKER_METRICS_INTERVAL_S = 10.0
 
 
 class FutureWrapper(Future):
@@ -141,7 +143,13 @@ class MultiprocExecutor(Executor):
         mm_feature_prefetch_handle: Handle | None = None
         self.mm_feature_prefetch_ack_queue: Any | None = None
         self._mm_feature_prefetch_submit_queue: (
-            queue.Queue[MMFeaturePrefetchItem | None] | None
+            queue.Queue[
+                MMFeaturePrefetchItem | MMFeaturePrefetchRelease | None
+            ]
+            | None
+        ) = None
+        self._mm_feature_prefetch_submit_slots: (
+            threading.BoundedSemaphore | None
         ) = None
         self._mm_feature_prefetch_sender_thread: Thread | None = None
 
@@ -189,8 +197,13 @@ class MultiprocExecutor(Executor):
                     self.mm_feature_prefetch_mq.export_handle()
                 )
                 self.mm_feature_prefetch_ack_queue = context.Queue()
-                self._mm_feature_prefetch_submit_queue = queue.Queue(
-                    maxsize=max(64, self.world_size * 16)
+                max_pending_prefetches = max(64, self.world_size * 16)
+                # The FIFO itself is unbounded so RELEASE control messages can
+                # never be dropped. Data items are bounded independently by a
+                # semaphore, preserving FIFO order between PUT and RELEASE.
+                self._mm_feature_prefetch_submit_queue = queue.Queue()
+                self._mm_feature_prefetch_submit_slots = (
+                    threading.BoundedSemaphore(max_pending_prefetches)
                 )
         # Create workers
         shared_worker_lock = context.Lock()
@@ -323,6 +336,36 @@ class MultiprocExecutor(Executor):
                     continue
                 if item is None:
                     return
+                if isinstance(item, MMFeaturePrefetchItem):
+                    slots = self._mm_feature_prefetch_submit_slots
+                    if slots is not None:
+                        slots.release()
+                if isinstance(item, MMFeaturePrefetchRelease):
+                    warned = False
+                    while not self.shutdown_event.is_set():
+                        try:
+                            with record_function_or_nullcontext(
+                                "multiproc_executor: "
+                                "mm_feature_prefetch_release"
+                            ):
+                                self.mm_feature_prefetch_mq.enqueue(
+                                    item,
+                                    timeout=0.1,
+                                )
+                            break
+                        except Exception:
+                            if not warned:
+                                logger.warning(
+                                    "MM feature release send failed; retrying "
+                                    "until delivery or executor shutdown: "
+                                    "identifier=%s generation=%d",
+                                    item.identifier,
+                                    item.generation,
+                                    exc_info=True,
+                                )
+                                warned = True
+                            self.shutdown_event.wait(0.05)
+                    continue
                 try:
                     with record_function_or_nullcontext(
                         "multiproc_executor: mm_feature_prefetch_send"
@@ -333,7 +376,11 @@ class MultiprocExecutor(Executor):
                         "MM feature prefetch data-plane send failed; "
                         "affected requests will use inline SchedulerOutput data."
                     )
-                    self._emit_mm_feature_prefetch_failure(item.identifier)
+                    if isinstance(item, MMFeaturePrefetchItem):
+                        self._emit_mm_feature_prefetch_failure(
+                            item.identifier,
+                            item.generation,
+                        )
 
         self._mm_feature_prefetch_sender_thread = Thread(
             target=sender_loop,
@@ -342,49 +389,70 @@ class MultiprocExecutor(Executor):
         )
         self._mm_feature_prefetch_sender_thread.start()
 
-    def _emit_mm_feature_prefetch_failure(self, identifier: str) -> None:
+    def _emit_mm_feature_prefetch_failure(
+        self,
+        identifier: str,
+        generation: int,
+    ) -> None:
         ack_queue = self.mm_feature_prefetch_ack_queue
         if ack_queue is None:
             return
         for rank in range(self.world_size):
             try:
-                ack_queue.put_nowait((rank, identifier, False))
+                ack_queue.put_nowait(
+                    (rank, identifier, generation, False)
+                )
             except (OSError, ValueError):
                 return
 
     def prefetch_mm_features(
         self,
-        features: list[MultiModalFeatureSpec],
-    ) -> set[str]:
+        items: list[MMFeaturePrefetchItem],
+    ) -> set[tuple[str, int]]:
         """Queue data-plane sends without waiting for serialization or ACKs."""
 
         submit_queue = self._mm_feature_prefetch_submit_queue
-        if not self.supports_mm_feature_prefetch or submit_queue is None:
+        slots = self._mm_feature_prefetch_submit_slots
+        if (
+            not self.supports_mm_feature_prefetch
+            or submit_queue is None
+            or slots is None
+        ):
             return set()
 
-        accepted: set[str] = set()
-        for feature in features:
+        accepted: set[tuple[str, int]] = set()
+        for item in items:
             if (
-                feature.data is None
-                or not feature.identifier
-                or feature.identifier in accepted
+                item.data is None
+                or not item.identifier
+                or (item.identifier, item.generation) in accepted
             ):
                 continue
-            try:
-                submit_queue.put_nowait(
-                    MMFeaturePrefetchItem(
-                        identifier=feature.identifier,
-                        data=feature.data,
-                    )
-                )
-            except queue.Full:
+            if not slots.acquire(blocking=False):
                 logger.warning_once(
                     "MM feature prefetch submission queue is full; "
                     "affected requests will keep inline feature data."
                 )
                 break
-            accepted.add(feature.identifier)
+            try:
+                submit_queue.put_nowait(item)
+            except Exception:
+                slots.release()
+                raise
+            accepted.add((item.identifier, item.generation))
         return accepted
+
+    def release_mm_features(
+        self,
+        releases: list[MMFeaturePrefetchRelease],
+    ) -> None:
+        """Enqueue releases reliably and in FIFO order with data PUTs."""
+
+        submit_queue = self._mm_feature_prefetch_submit_queue
+        if not self.supports_mm_feature_prefetch or submit_queue is None:
+            return
+        for release in releases:
+            submit_queue.put_nowait(release)
 
     def poll_mm_prefetch_acks(self) -> list[MMFeaturePrefetchAck]:
         ack_queue = self.mm_feature_prefetch_ack_queue
@@ -875,15 +943,34 @@ class WorkerProc:
             return
 
         def receiver_loop() -> None:
+            next_metrics_log_at = (
+                time.monotonic() + _MM_FEATURE_PREFETCH_WORKER_METRICS_INTERVAL_S
+            )
+
+            def maybe_log_metrics() -> None:
+                nonlocal next_metrics_log_at
+                now = time.monotonic()
+                if now < next_metrics_log_at:
+                    return
+                next_metrics_log_at = (
+                    now + _MM_FEATURE_PREFETCH_WORKER_METRICS_INTERVAL_S
+                )
+                cache = self.worker.mm_feature_prefetch_cache
+                if cache is not None:
+                    cache.log_metrics(rank=self.rank)
+
             while not self._mm_feature_prefetch_shutdown_event.is_set():
                 try:
                     with record_function_or_nullcontext(
                         "worker: mm_feature_prefetch_receive"
                     ):
                         item = prefetch_mq.dequeue(
+                            timeout=_MM_FEATURE_PREFETCH_WORKER_METRICS_INTERVAL_S,
                             cancel=self._mm_feature_prefetch_shutdown_event,
-                            indefinite=True,
                         )
+                except TimeoutError:
+                    maybe_log_metrics()
+                    continue
                 except RuntimeError:
                     if self._mm_feature_prefetch_shutdown_event.is_set():
                         return
@@ -898,12 +985,38 @@ class WorkerProc:
                     )
                     continue
 
+                if isinstance(item, MMFeaturePrefetchRelease):
+                    try:
+                        released = self.worker.release_prefetched_mm_feature(
+                            item.identifier,
+                            item.generation,
+                        )
+                        if not released:
+                            logger.debug(
+                                "Ignoring stale or missing MM feature release: "
+                                "rank=%d identifier=%s generation=%d",
+                                self.rank,
+                                item.identifier,
+                                item.generation,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Failed to release prefetched MM feature %r "
+                            "generation=%d.",
+                            item.identifier,
+                            item.generation,
+                        )
+                    maybe_log_metrics()
+                    continue
+
                 success = False
                 identifier = getattr(item, "identifier", "")
+                generation = getattr(item, "generation", -1)
                 if isinstance(item, MMFeaturePrefetchItem):
                     try:
                         success = self.worker.cache_prefetched_mm_feature(
                             item.identifier,
+                            item.generation,
                             item.data,
                         )
                     except Exception:
@@ -918,9 +1031,12 @@ class WorkerProc:
                         "execution remains on the inline-data path."
                     )
                 try:
-                    ack_queue.put_nowait((self.rank, identifier, success))
+                    ack_queue.put_nowait(
+                        (self.rank, identifier, generation, success)
+                    )
                 except (OSError, ValueError):
                     return
+                maybe_log_metrics()
 
         self._mm_feature_prefetch_receiver_thread = Thread(
             target=receiver_loop,

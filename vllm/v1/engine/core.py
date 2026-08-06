@@ -6,7 +6,7 @@ import signal
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
@@ -55,6 +55,16 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.coordinator_metrics import (
+    COORDINATOR_ACK_METRIC,
+    COORDINATOR_PREFETCH_ACK_METRIC,
+    ENGINECORE_ADD_METRIC,
+    ENGINECORE_DIRECT_BASELINE_ENABLED_CONFIG_KEY,
+    INPUT_PREPROCESS_METRIC,
+    EngineCoreCoordinatorMetrics,
+    EngineCoreInstrumentationConfig,
+    thread_cpu_time_ns,
+)
 from vllm.v1.engine.prefill_coordinator import StreamingPrefillCoordinator
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -69,9 +79,14 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.mm_feature_prefetch import (
+    MM_FEATURE_PREFETCH_HORIZON_CHUNKS_CONFIG_KEY,
+)
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+_MM_FEATURE_PREFETCH_METRICS_INTERVAL_S = 10.0
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -108,6 +123,50 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        instrumentation_config = (
+            EngineCoreInstrumentationConfig.from_vllm_config(vllm_config)
+        )
+        self.coordinator_cpu_metrics = EngineCoreCoordinatorMetrics(
+            instrumentation_config
+        )
+        self._coordinator_cpu_metrics_enabled = (
+            self.coordinator_cpu_metrics.enabled
+        )
+        self._enginecore_input_observability_enabled = (
+            instrumentation_config.input_drain_observability_enabled
+        )
+        self._input_drain_max_messages = (
+            instrumentation_config.input_drain_max_messages
+        )
+        self._input_drain_max_time_ns = (
+            instrumentation_config.input_drain_max_time_ns
+        )
+        additional_config = vllm_config.additional_config
+        raw_prefetch_horizon = (
+            additional_config.get(
+                MM_FEATURE_PREFETCH_HORIZON_CHUNKS_CONFIG_KEY,
+                2,
+            )
+            if isinstance(additional_config, dict)
+            else 2
+        )
+        if (
+            isinstance(raw_prefetch_horizon, bool)
+            or not isinstance(raw_prefetch_horizon, int)
+            or raw_prefetch_horizon < 0
+        ):
+            raise ValueError(
+                f"{MM_FEATURE_PREFETCH_HORIZON_CHUNKS_CONFIG_KEY} must be "
+                "a non-negative integer"
+            )
+        self._mm_feature_prefetch_horizon_chunks = raw_prefetch_horizon
+        self._direct_streaming_prefill_baseline_enabled = bool(
+            isinstance(additional_config, dict)
+            and additional_config.get(
+                ENGINECORE_DIRECT_BASELINE_ENABLED_CONFIG_KEY,
+                False,
+            )
+        )
         if vllm_config.parallel_config.data_parallel_rank == 0:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -231,7 +290,41 @@ class EngineCore:
                 if self.model_executor.supports_mm_feature_prefetch
                 else None
             ),
+            release_mm_features=(
+                self.model_executor.release_mm_features
+                if self.model_executor.supports_mm_feature_prefetch
+                else None
+            ),
+            feature_prefetch_horizon_chunks=(
+                self._mm_feature_prefetch_horizon_chunks
+            ),
         )
+        # Coordinator hot paths may publish finer-grained categories without
+        # expanding its public constructor. The metrics object is a no-op when
+        # profiling is disabled.
+        self.streaming_prefill_coordinator.cpu_metrics = (
+            self.coordinator_cpu_metrics
+        )
+        # This is deliberately separate from optional CPU profiling. One
+        # monotonic-clock check per EngineCore step is enough to leave a useful
+        # tuning trail when the benchmark launcher later terminates the stack.
+        # Keep the ordinary (side-channel-disabled) EngineCore path entirely
+        # free of this clock read.
+        self._mm_feature_prefetch_metrics_enabled = (
+            self.model_executor.supports_mm_feature_prefetch
+        )
+        self._next_mm_feature_prefetch_metrics_log_at = 0.0
+        if self._mm_feature_prefetch_metrics_enabled:
+            self._next_mm_feature_prefetch_metrics_log_at = (
+                time.monotonic() + _MM_FEATURE_PREFETCH_METRICS_INTERVAL_S
+            )
+        self._deferred_mm_feature_abort_dispatches: set[str] = set()
+        self._direct_prefill_requests_by_context: dict[
+            tuple[int, int], set[str]
+        ] = {}
+        self._direct_prefill_context_by_request: dict[
+            str, tuple[int, int]
+        ] = {}
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -299,6 +392,20 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        if not getattr(self, "_coordinator_cpu_metrics_enabled", False):
+            return self._add_request_impl(request, request_wave)
+
+        started_cpu_ns = thread_cpu_time_ns()
+        try:
+            return self._add_request_impl(request, request_wave)
+        finally:
+            self.coordinator_cpu_metrics.record_cpu_ns(
+                ENGINECORE_ADD_METRIC,
+                thread_cpu_time_ns() - started_cpu_ns,
+            )
+            self.coordinator_cpu_metrics.maybe_emit()
+
+    def _add_request_impl(self, request: Request, request_wave: int = 0):
         self._poll_mm_feature_prefetch_acks()
 
         # Validate the request_id type.
@@ -327,6 +434,33 @@ class EngineCore:
             )
 
         coordinator = self.streaming_prefill_coordinator
+        if (
+            getattr(
+                self,
+                "_direct_streaming_prefill_baseline_enabled",
+                False,
+            )
+            and request.prefill_context is not None
+        ):
+            # Exact microbenchmark baseline: the upper layer still submits
+            # every immutable Context version, but EngineCore performs no
+            # coalescing and uses no feature-prefetch side channel.
+            self.scheduler.add_request(request)
+            metadata = request.prefill_context
+            if metadata.kind == "streaming":
+                key = (
+                    metadata.router_session_id,
+                    metadata.context_lifetime_id,
+                )
+                self._direct_prefill_requests_by_context.setdefault(
+                    key,
+                    set(),
+                ).add(request.request_id)
+                self._direct_prefill_context_by_request[
+                    request.request_id
+                ] = key
+            self._poll_mm_feature_prefetch_acks()
+            return
         if coordinator.handles_streaming(request):
             coordinator.add_streaming(request)
             self._poll_mm_feature_prefetch_acks()
@@ -356,6 +490,111 @@ class EngineCore:
                 scheduler_request_ids,
                 RequestStatus.FINISHED_ABORTED,
             )
+            self._forget_direct_prefill_requests(scheduler_request_ids)
+            self._finish_or_defer_aborted_mm_feature_dispatches(
+                scheduler_request_ids
+            )
+
+    def _forget_direct_prefill_requests(
+        self,
+        request_ids: Iterable[str],
+    ) -> None:
+        context_by_request = getattr(
+            self,
+            "_direct_prefill_context_by_request",
+            None,
+        )
+        requests_by_context = getattr(
+            self,
+            "_direct_prefill_requests_by_context",
+            None,
+        )
+        if not context_by_request or requests_by_context is None:
+            return
+        for request_id in request_ids:
+            key = context_by_request.pop(request_id, None)
+            if key is None:
+                continue
+            context_requests = requests_by_context.get(key)
+            if context_requests is None:
+                continue
+            context_requests.discard(request_id)
+            if not context_requests:
+                requests_by_context.pop(key, None)
+
+    def _finish_direct_prefill_outputs(
+        self,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> None:
+        context_by_request = getattr(
+            self,
+            "_direct_prefill_context_by_request",
+            None,
+        )
+        if not context_by_request:
+            return
+        self._forget_direct_prefill_requests(
+            output.request_id
+            for outputs in engine_core_outputs.values()
+            for output in outputs.outputs
+            if output.finished and output.request_id in context_by_request
+        )
+
+    def _finish_or_defer_aborted_mm_feature_dispatches(
+        self,
+        request_ids: list[str],
+    ) -> None:
+        """Release leases now, or after queued Worker futures have drained."""
+
+        batch_queue = self.batch_queue
+        if batch_queue is None:
+            self.streaming_prefill_coordinator.finish_aborted_dispatches(
+                request_ids
+            )
+            return
+
+        queued_ids = {
+            request_id
+            for _future, scheduler_output in batch_queue
+            for request_id in scheduler_output.num_scheduled_tokens
+        }
+        deferred = set(request_ids) & queued_ids
+        immediate = [
+            request_id
+            for request_id in request_ids
+            if request_id not in deferred
+        ]
+        if immediate:
+            self.streaming_prefill_coordinator.finish_aborted_dispatches(
+                immediate
+            )
+        self._deferred_mm_feature_abort_dispatches.update(deferred)
+
+    def _finish_drained_mm_feature_abort_dispatches(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        deferred = self._deferred_mm_feature_abort_dispatches
+        if not deferred:
+            return
+        completed_batch_ids = (
+            set(scheduler_output.num_scheduled_tokens) & deferred
+        )
+        if not completed_batch_ids:
+            return
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+        still_queued = {
+            request_id
+            for _future, queued_output in batch_queue
+            for request_id in queued_output.num_scheduled_tokens
+        }
+        releasable = completed_batch_ids - still_queued
+        if releasable:
+            self.streaming_prefill_coordinator.finish_aborted_dispatches(
+                list(releasable)
+            )
+            deferred.difference_update(releasable)
 
     def request_interrupt_preempt(
         self,
@@ -427,6 +666,7 @@ class EngineCore:
             return self._step()
 
     def _step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        self._maybe_log_mm_feature_prefetch_metrics()
         self._poll_mm_feature_prefetch_acks()
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -449,17 +689,79 @@ class EngineCore:
                 scheduler_output, model_output
             )
         self._poll_mm_feature_prefetch_acks()
-        self.streaming_prefill_coordinator.update_after_step(
-            scheduler_output,
-            engine_core_outputs,
+        self._update_streaming_prefill_after_step(
+            scheduler_output, engine_core_outputs
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    def _maybe_log_mm_feature_prefetch_metrics(self) -> None:
+        """Periodically write aggregate side-channel tuning counters."""
+
+        if not self._mm_feature_prefetch_metrics_enabled:
+            return
+        now = time.monotonic()
+        if now < self._next_mm_feature_prefetch_metrics_log_at:
+            return
+        self._next_mm_feature_prefetch_metrics_log_at = (
+            now + _MM_FEATURE_PREFETCH_METRICS_INTERVAL_S
+        )
+        self.streaming_prefill_coordinator.log_mm_prefetch_metrics(
+            interval=True,
+        )
+
     def _poll_mm_feature_prefetch_acks(self) -> None:
+        if not getattr(self, "_coordinator_cpu_metrics_enabled", False):
+            self._poll_mm_feature_prefetch_acks_impl()
+            return
+
+        started_cpu_ns = thread_cpu_time_ns()
+        ack_count = self._poll_mm_feature_prefetch_acks_impl()
+        self.coordinator_cpu_metrics.record_cpu_ns(
+            COORDINATOR_PREFETCH_ACK_METRIC,
+            thread_cpu_time_ns() - started_cpu_ns,
+        )
+        if ack_count:
+            self.coordinator_cpu_metrics.record_counter(
+                "coordinator_prefetch_ack_count",
+                ack_count,
+            )
+
+    def _poll_mm_feature_prefetch_acks_impl(self) -> int:
         acks = self.model_executor.poll_mm_prefetch_acks()
         if acks:
             self.streaming_prefill_coordinator.update_mm_prefetch_acks(acks)
+        return len(acks)
+
+    def _update_streaming_prefill_after_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> None:
+        if getattr(
+            self,
+            "_direct_streaming_prefill_baseline_enabled",
+            False,
+        ):
+            self._finish_direct_prefill_outputs(engine_core_outputs)
+            return
+        if not getattr(self, "_coordinator_cpu_metrics_enabled", False):
+            self.streaming_prefill_coordinator.update_after_step(
+                scheduler_output,
+                engine_core_outputs,
+            )
+            return
+
+        started_cpu_ns = thread_cpu_time_ns()
+        self.streaming_prefill_coordinator.update_after_step(
+            scheduler_output,
+            engine_core_outputs,
+        )
+        self.coordinator_cpu_metrics.record_cpu_ns(
+            COORDINATOR_ACK_METRIC,
+            thread_cpu_time_ns() - started_cpu_ns,
+        )
+        self.coordinator_cpu_metrics.maybe_emit()
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -493,6 +795,7 @@ class EngineCore:
     def _step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        self._maybe_log_mm_feature_prefetch_metrics()
         self._poll_mm_feature_prefetch_acks()
         batch_queue = self.batch_queue
         assert batch_queue is not None
@@ -566,9 +869,8 @@ class EngineCore:
                 scheduler_output, model_output
             )
         self._poll_mm_feature_prefetch_acks()
-        self.streaming_prefill_coordinator.update_after_step(
-            scheduler_output,
-            engine_core_outputs,
+        self._update_streaming_prefill_after_step(
+            scheduler_output, engine_core_outputs
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -586,9 +888,14 @@ class EngineCore:
                 )
             batch_queue.appendleft((future, deferred_scheduler_output))
 
+        self._finish_drained_mm_feature_abort_dispatches(
+            scheduler_output
+        )
         return engine_core_outputs, model_executed
 
     def shutdown(self):
+        self.streaming_prefill_coordinator.log_mm_prefetch_metrics()
+        self.coordinator_cpu_metrics.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -624,6 +931,32 @@ class EngineCore:
     ) -> None:
         """Retire one application media-context lifetime idempotently."""
 
+        if getattr(
+            self,
+            "_direct_streaming_prefill_baseline_enabled",
+            False,
+        ):
+            key = (router_session_id, context_lifetime_id)
+            request_ids = list(
+                getattr(
+                    self,
+                    "_direct_prefill_requests_by_context",
+                    {},
+                ).pop(key, ())
+            )
+            self._forget_direct_prefill_requests(request_ids)
+            scheduler_request_ids = [
+                request_id
+                for request_id in request_ids
+                if request_id in self.scheduler.requests  # type: ignore[attr-defined]
+            ]
+            if scheduler_request_ids:
+                self.scheduler.finish_requests(
+                    scheduler_request_ids,
+                    RequestStatus.FINISHED_ABORTED,
+                )
+            return
+
         physical_request_ids = (
             self.streaming_prefill_coordinator.retire_context(
                 router_session_id,
@@ -634,6 +967,9 @@ class EngineCore:
             self.scheduler.finish_requests(
                 physical_request_ids,
                 RequestStatus.FINISHED_ABORTED,
+            )
+            self._finish_or_defer_aborted_mm_feature_dispatches(
+                physical_request_ids
             )
 
     def sleep(self, level: int = 1):
@@ -685,6 +1021,22 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if not getattr(self, "_coordinator_cpu_metrics_enabled", False):
+            return self._preprocess_add_request_impl(request)
+
+        started_cpu_ns = thread_cpu_time_ns()
+        try:
+            return self._preprocess_add_request_impl(request)
+        finally:
+            self.coordinator_cpu_metrics.record_cpu_ns(
+                INPUT_PREPROCESS_METRIC,
+                thread_cpu_time_ns() - started_cpu_ns,
+            )
+
+    def _preprocess_add_request_impl(
+        self,
+        request: EngineCoreRequest,
+    ) -> tuple[Request, int]:
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
@@ -701,6 +1053,16 @@ class EngineCore:
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
             self.structured_output_manager.grammar_init(req)
+        # Offer restored feature snapshots after all fallible preprocessing and
+        # before this request waits for the EngineCore main loop. This method
+        # only mutates the tracker's locked transport state; context/coalescing
+        # and Scheduler state stay main-thread owned.
+        if not getattr(
+            self,
+            "_direct_streaming_prefill_baseline_enabled",
+            False,
+        ):
+            self.streaming_prefill_coordinator.offer_mm_features_early(req)
         return req, request.current_wave
 
 
@@ -1018,6 +1380,12 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
+        if self._enginecore_input_observability_enabled:
+            self._process_input_queue_observed()
+            return
+
+        # Keep the default path byte-for-byte equivalent to vLLM's unbounded
+        # drain policy apart from the single feature-toggle branch above.
         waited = False
         while (
             not self.engines_running
@@ -1037,6 +1405,92 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+    def _process_input_queue_observed(self) -> None:
+        """Drain client work with optional per-round fairness budgets.
+
+        The blocking phase is never cut short until at least one engine step can
+        run. Once runnable work exists, a message or wall-time budget can yield
+        back to scheduling while leaving the remaining requests in the queue.
+        ``None`` budgets preserve the original unbounded drain behavior.
+        """
+
+        metrics_enabled = getattr(
+            self,
+            "_coordinator_cpu_metrics_enabled",
+            False,
+        )
+        max_messages = self._input_drain_max_messages
+        max_time_ns = self._input_drain_max_time_ns
+        depth_before = self.input_queue.qsize()
+        message_count = 0
+        message_budget_hit = False
+        time_budget_hit = False
+        processing_started_wall_ns: int | None = None
+        started_cpu_ns = thread_cpu_time_ns() if metrics_enabled else 0
+
+        def handle(req: tuple[EngineCoreRequestType, Any]) -> None:
+            nonlocal message_count, processing_started_wall_ns, depth_before
+            if processing_started_wall_ns is None and (
+                metrics_enabled or max_time_ns is not None
+            ):
+                processing_started_wall_ns = time.monotonic_ns()
+            depth_before = max(depth_before, self.input_queue.qsize() + 1)
+            self._handle_client_request(*req)
+            message_count += 1
+
+        waited = False
+        while (
+            not self.engines_running
+            and not self.scheduler.has_requests()
+            and not self.batch_queue
+        ):
+            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
+                logger.debug("EngineCore waiting for work.")
+                waited = True
+            handle(self.input_queue.get())
+
+        if waited:
+            logger.debug("EngineCore loop active.")
+
+        while True:
+            queue_nonempty = not self.input_queue.empty()
+            if not queue_nonempty:
+                break
+            if max_messages is not None and message_count >= max_messages:
+                message_budget_hit = True
+                break
+            if max_time_ns is not None:
+                if processing_started_wall_ns is None:
+                    processing_started_wall_ns = time.monotonic_ns()
+                if (
+                    time.monotonic_ns() - processing_started_wall_ns
+                    >= max_time_ns
+                ):
+                    time_budget_hit = True
+                    break
+            try:
+                req = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            handle(req)
+
+        if not metrics_enabled:
+            return
+
+        ended_wall_ns = time.monotonic_ns()
+        if processing_started_wall_ns is None:
+            processing_started_wall_ns = ended_wall_ns
+        self.coordinator_cpu_metrics.record_input_drain(
+            message_count=message_count,
+            cpu_ns=thread_cpu_time_ns() - started_cpu_ns,
+            wall_ns=ended_wall_ns - processing_started_wall_ns,
+            depth_before=depth_before,
+            depth_after=self.input_queue.qsize(),
+            message_budget_hit=message_budget_hit,
+            time_budget_hit=time_budget_hit,
+        )
+        self.coordinator_cpu_metrics.maybe_emit()
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

@@ -372,9 +372,7 @@ class WorkerWrapperBase:
         if prefetched_cache is not None:
             for req_data in scheduler_output.scheduled_new_reqs:
                 if not any(
-                    feature.data is None
-                    and feature.identifier in prefetched_cache
-                    for feature in req_data.mm_features
+                    feature.data is None for feature in req_data.mm_features
                 ):
                     continue
                 with record_function_or_nullcontext(
@@ -407,12 +405,31 @@ class WorkerWrapperBase:
     def cache_prefetched_mm_feature(
         self,
         identifier: str,
+        generation: int,
         data: Any,
     ) -> bool:
         """Store one item received by the worker's prefetch thread."""
 
         cache = self.mm_feature_prefetch_cache
-        return False if cache is None else cache.put(identifier, data)
+        return (
+            False
+            if cache is None
+            else cache.put(identifier, generation, data)
+        )
+
+    def release_prefetched_mm_feature(
+        self,
+        identifier: str,
+        generation: int,
+    ) -> bool:
+        """Release one exact feature generation for LRU eviction."""
+
+        cache = self.mm_feature_prefetch_cache
+        return (
+            False
+            if cache is None
+            else cache.release(identifier, generation)
+        )
 
     def execute_model(
         self,

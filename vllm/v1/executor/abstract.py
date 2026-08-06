@@ -24,7 +24,10 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
-    from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.v1.worker.mm_feature_prefetch import (
+        MMFeaturePrefetchItem,
+        MMFeaturePrefetchRelease,
+    )
 
 logger = init_logger(__name__)
 
@@ -214,13 +217,21 @@ class Executor(ABC):
 
     def prefetch_mm_features(
         self,
-        features: list["MultiModalFeatureSpec"],
-    ) -> set[str]:
+        items: list["MMFeaturePrefetchItem"],
+    ) -> set[str] | set[tuple[str, int]]:
         """Opportunistically enqueue feature data without waiting for workers."""
 
         return set()
 
-    def poll_mm_prefetch_acks(self) -> list[tuple[int, str, bool]]:
+    def release_mm_features(
+        self,
+        releases: list["MMFeaturePrefetchRelease"],
+    ) -> None:
+        """Reliably enqueue worker-cache releases on the feature data plane."""
+
+        return None
+
+    def poll_mm_prefetch_acks(self) -> list[tuple[int, str, int, bool]]:
         """Return currently available worker acknowledgements."""
 
         return []

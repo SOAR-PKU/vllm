@@ -68,6 +68,7 @@ def make_request(
     hash_fn: Callable = hash,
     mm_positions: list[PlaceholderRange] | None = None,
     mm_hashes: list[str] | None = None,
+    mm_modalities: list[str] | None = None,
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
 ):
@@ -79,7 +80,7 @@ def make_request(
                 data=MultiModalKwargsItem.dummy("dummy_m"),
                 mm_position=position,
                 identifier=identifier,
-                modality="image",
+                modality=mm_modalities[j] if mm_modalities else "image",
             )
             mm_features.append(mm_feature)
 
@@ -384,12 +385,12 @@ def test_generate_block_hash_extra_keys():
 
     # Test with no extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 0, 5, 0)
-    assert extra_keys == ("hash1",)
+    assert extra_keys == (("hash1", "image", 0, 5),)
     assert next_mm_idx == 1
 
     # Test with partial overlap
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 3, 8, 0)
-    assert extra_keys == ("hash1",)
+    assert extra_keys == (("hash1", "image", 0, 5),)
     assert next_mm_idx == 1
 
     # Test with no overlap
@@ -399,7 +400,10 @@ def test_generate_block_hash_extra_keys():
 
     # Test with multiple extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request, 0, 15, 0)
-    assert extra_keys == ("hash1", "hash2")
+    assert extra_keys == (
+        ("hash1", "image", 0, 5),
+        ("hash2", "image", 10, 5),
+    )
     assert next_mm_idx == 2
 
 
@@ -450,7 +454,7 @@ def test_generate_block_hash_extra_keys_cache_salt():
 
     # Test with no extra keys
     extra_keys, next_mm_idx = generate_block_hash_extra_keys(request_mm, 0, 5, 0)
-    assert extra_keys == ("hash1", "salt")
+    assert extra_keys == (("hash1", "image", 0, 5), "salt")
     assert next_mm_idx == 1
 
 
@@ -547,8 +551,20 @@ def test_request_block_hasher(hash_fn):
 
     block_hashes = request.block_hashes
     assert len(block_hashes) == 2
-    assert block_hashes[0] == hash_fn((kv_cache_utils.NONE_HASH, (0, 1, 2), ("hash1",)))
-    assert block_hashes[1] == hash_fn((block_hashes[0], (3, 4, 5), ("hash2",)))
+    assert block_hashes[0] == hash_fn(
+        (
+            kv_cache_utils.NONE_HASH,
+            (0, 1, 2),
+            (("hash1", "image", 0, 3),),
+        )
+    )
+    assert block_hashes[1] == hash_fn(
+        (
+            block_hashes[0],
+            (3, 4, 5),
+            (("hash2", "image", 3, 3),),
+        )
+    )
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -577,6 +593,43 @@ def test_hash_tokens_different_mm_input(hash_fn):
     block_hashes2 = request2.block_hashes
     assert block_hashes1[0] != block_hashes2[0]
     assert block_hashes1[1] != block_hashes2[1]
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+@pytest.mark.parametrize(
+    ("mm_position", "modality"),
+    [
+        (PlaceholderRange(offset=0, length=3), "audio"),
+        (PlaceholderRange(offset=1, length=2), "image"),
+        (PlaceholderRange(offset=0, length=2), "image"),
+    ],
+)
+def test_hash_tokens_different_mm_descriptor(
+    hash_fn: Callable[[Any], bytes],
+    mm_position: PlaceholderRange,
+    modality: str,
+):
+    prompt_token_ids = [0, 1, 2]
+    baseline = make_request(
+        request_id="baseline",
+        prompt_token_ids=prompt_token_ids,
+        block_size=3,
+        hash_fn=hash_fn,
+        mm_positions=[PlaceholderRange(offset=0, length=3)],
+        mm_hashes=["shared-identifier"],
+        mm_modalities=["image"],
+    )
+    changed_descriptor = make_request(
+        request_id="changed",
+        prompt_token_ids=prompt_token_ids,
+        block_size=3,
+        hash_fn=hash_fn,
+        mm_positions=[mm_position],
+        mm_hashes=["shared-identifier"],
+        mm_modalities=[modality],
+    )
+
+    assert baseline.block_hashes[0] != changed_descriptor.block_hashes[0]
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1677,7 +1730,7 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
         (
             kv_cache_utils.NONE_HASH,
             tuple(prompt_token_ids[:block_size]),
-            ("hash1", block1_embeds_bytes),
+            (("hash1", "image", 0, 3), block1_embeds_bytes),
         )
     )
     assert block_hashes[0] == expected_hash1
@@ -1687,7 +1740,7 @@ def test_request_with_prompt_embeds_and_mm_inputs(hash_fn: Callable[[Any], bytes
         (
             block_hashes[0],
             tuple(prompt_token_ids[block_size:num_tokens]),
-            ("hash2", block2_embeds_bytes),
+            (("hash2", "image", 3, 3), block2_embeds_bytes),
         )
     )
     assert block_hashes[1] == expected_hash2
