@@ -378,6 +378,51 @@ class Scheduler(SchedulerInterface):
         victim.preemptive_admit_eligible = False
         return self._prepare_interrupt_force_save(victim)
 
+    def _get_priority_admission_victim(
+        self,
+        target: Request,
+        scheduled_running_reqs: list[Request],
+    ) -> Request | None:
+        """Pick an unscheduled lower-priority request to free admission space."""
+        if self.policy != SchedulingPolicy.PRIORITY:
+            return None
+
+        target_rank = (target.priority, target.arrival_time)
+        scheduled_req_ids = {
+            request.request_id for request in scheduled_running_reqs
+        }
+        candidates = (
+            request
+            for request in self.running
+            if request.status == RequestStatus.RUNNING
+            and request.request_id not in scheduled_req_ids
+            and (request.priority, request.arrival_time) > target_rank
+            and not self._is_recovery_protected(request)
+        )
+        return max(
+            candidates,
+            key=lambda request: (request.priority, request.arrival_time),
+            default=None,
+        )
+
+    def _preempt_request(
+        self,
+        request: Request,
+        scheduled_timestamp: float,
+    ) -> None:
+        """Release a running request and return it to the ordinary wait queue."""
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(
+                EngineCoreEventType.PREEMPTED,
+                scheduled_timestamp,
+            )
+        self.waiting.prepend_request(request)
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -414,6 +459,7 @@ class Scheduler(SchedulerInterface):
         # First, schedule the RUNNING requests.
         if self.policy == SchedulingPolicy.PRIORITY:
             self.running.sort(key=lambda req: (req.priority, req.arrival_time))
+        priority_admission_request: Request | None = None
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -425,7 +471,10 @@ class Scheduler(SchedulerInterface):
             if (
                 self.policy == SchedulingPolicy.PRIORITY
                 and self.waiting
+                and not self.remote_kv_ready_interrupt
+                and not self.interrupt_waiting
                 and len(self.running) < self.max_num_running_reqs
+                and not self._is_recovery_protected(request)
             ):
                 waiting_request = self.waiting.peek_request()
                 if (
@@ -437,6 +486,7 @@ class Scheduler(SchedulerInterface):
                     )
                     < (request.priority, request.arrival_time)
                 ):
+                    priority_admission_request = waiting_request
                     break
 
             num_new_tokens = (
@@ -537,17 +587,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
-                    self.kv_cache_manager.free(preempted_req)
-                    self.encoder_cache_manager.free(preempted_req)
-                    preempted_req.status = RequestStatus.PREEMPTED
-                    preempted_req.num_computed_tokens = 0
-                    preempted_req.num_preemptions += 1
-                    if self.log_stats:
-                        preempted_req.record_event(
-                            EngineCoreEventType.PREEMPTED, scheduled_timestamp
-                        )
-
-                    self.waiting.prepend_request(preempted_req)
+                    self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -852,6 +892,18 @@ class Scheduler(SchedulerInterface):
                     # The request cannot be scheduled.
                     if restore_scheduling_base:
                         request.num_computed_tokens = logical_num_computed_tokens
+                    if (
+                        not active_waiting_is_interrupt
+                        and request is priority_admission_request
+                    ):
+                        victim = self._get_priority_admission_victim(
+                            request,
+                            scheduled_running_reqs,
+                        )
+                        if victim is not None:
+                            self.running.remove(victim)
+                            self._preempt_request(victim, scheduled_timestamp)
+                            preempted_reqs.append(victim)
                     break
 
                 # KVTransfer: the connector uses this info to determine

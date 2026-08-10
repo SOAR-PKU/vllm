@@ -1743,6 +1743,192 @@ def test_priority_waiting_foreground_runs_before_running_media_next_step():
     assert next_output.num_scheduled_tokens == {"query": 8}
 
 
+def test_priority_waiting_kv_admission_preempts_lower_running_request():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=48,
+        max_model_len=128,
+        enable_prefix_caching=False,
+        num_blocks=4,
+        block_size=16,
+    )
+    media = create_requests_with_priority(
+        num_requests=1,
+        priorities=[1],
+        arrival_times=[1.0],
+        num_tokens=16,
+        max_tokens=16,
+        req_ids=["media"],
+    )[0]
+    scheduler.add_request(media)
+
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens == {"media": 16}
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["media"],
+            req_id_to_index={"media": 0},
+            sampled_token_ids=[np.array([100])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=48,
+        max_tokens=1,
+        req_ids=["query"],
+    )[0]
+    scheduler.add_request(query)
+
+    preemption_output = scheduler.schedule()
+
+    assert preemption_output.num_scheduled_tokens == {}
+    assert media.status == RequestStatus.PREEMPTED
+    assert media.num_preemptions == 1
+    assert query.status == RequestStatus.WAITING
+    assert scheduler.running == []
+    assert [request.request_id for request in scheduler.waiting] == [
+        "query",
+        "media",
+    ]
+
+    admission_output = scheduler.schedule()
+
+    assert [req.req_id for req in admission_output.scheduled_new_reqs] == ["query"]
+    assert admission_output.num_scheduled_tokens == {"query": 48}
+    assert query.status == RequestStatus.RUNNING
+    assert media.status == RequestStatus.PREEMPTED
+
+    scheduler.update_from_output(
+        admission_output,
+        ModelRunnerOutput(
+            req_ids=["query"],
+            req_id_to_index={"query": 0},
+            sampled_token_ids=[np.array([100])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert query.is_finished()
+
+    resumption_output = scheduler.schedule()
+
+    assert resumption_output.scheduled_new_reqs == []
+    assert resumption_output.scheduled_cached_reqs.req_ids == ["media"]
+    assert resumption_output.scheduled_cached_reqs.resumed_req_ids == {"media"}
+    assert media.status == RequestStatus.RUNNING
+    assert media.num_preemptions == 1
+
+
+def test_priority_waiting_does_not_freeze_recovery_protected_running_request():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=48,
+        max_model_len=128,
+        enable_prefix_caching=False,
+        num_blocks=4,
+        block_size=16,
+    )
+    media = create_requests_with_priority(
+        num_requests=1,
+        priorities=[1],
+        arrival_times=[1.0],
+        num_tokens=16,
+        max_tokens=16,
+        req_ids=["media"],
+    )[0]
+    scheduler.add_request(media)
+
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["media"],
+            req_id_to_index={"media": 0},
+            sampled_token_ids=[np.array([100])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    media.recovery_protected_until_step = scheduler._interrupt_scheduler_step + 2
+    media.recovery_protected_until_ts = 0.0
+
+    query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=48,
+        max_tokens=1,
+        req_ids=["query"],
+    )[0]
+    scheduler.add_request(query)
+
+    protected_output = scheduler.schedule()
+
+    assert protected_output.num_scheduled_tokens == {"media": 1}
+    assert media.status == RequestStatus.RUNNING
+    assert media.num_preemptions == 0
+    assert query.status == RequestStatus.WAITING
+
+
+def test_priority_waiting_does_not_preempt_when_sequence_slots_are_full():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=1,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefix_caching=False,
+        num_blocks=16,
+        block_size=16,
+    )
+    media = create_requests_with_priority(
+        num_requests=1,
+        priorities=[1],
+        arrival_times=[1.0],
+        num_tokens=32,
+        req_ids=["media"],
+    )[0]
+    scheduler.add_request(media)
+
+    first_output = scheduler.schedule()
+    assert first_output.num_scheduled_tokens == {"media": 8}
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=["media"],
+            req_id_to_index={"media": 0},
+            sampled_token_ids=[np.array([])],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    query = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=8,
+        max_tokens=1,
+        req_ids=["query"],
+    )[0]
+    scheduler.add_request(query)
+
+    next_output = scheduler.schedule()
+
+    assert next_output.num_scheduled_tokens == {"media": 8}
+    assert query.status == RequestStatus.WAITING
+    assert media.status == RequestStatus.RUNNING
+    assert media.num_preemptions == 0
+
+
 def test_priority_running_query_keeps_fcfs_order_over_later_query():
     scheduler = create_scheduler_with_priority(
         max_num_seqs=4,
