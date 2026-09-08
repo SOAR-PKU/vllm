@@ -6,6 +6,7 @@ import time
 from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from copy import copy
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -49,6 +50,9 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         prefill_context: PrefillContextMetadata | None = None,
         copy_prompt_token_ids_to_all: bool = True,
+        is_streaming_prompt: bool = False,
+        is_streaming_prompt_finished: bool = False,
+        is_prompt_update: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -115,6 +119,18 @@ class Request:
         self.mm_features = mm_features or []
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
+
+        # Mutable streaming requests keep one physical Request alive while its
+        # append-only prompt grows. ``worker_prompt_revision`` is scheduler-side
+        # delivery state; workers keep their own applied revision.
+        self.is_streaming_anchor = False
+        self.streaming_anchor_open = False
+        self.streaming_anchor_parked = False
+        self.prompt_revision = 0
+        self.worker_prompt_revision = -1
+        self.is_streaming_prompt = is_streaming_prompt
+        self.is_streaming_prompt_finished = is_streaming_prompt_finished
+        self.is_prompt_update = is_prompt_update
 
         # Read-only views
         # Prevent directly appending to these lists since
@@ -192,9 +208,15 @@ class Request:
             block_hasher=block_hasher,
             prefill_context=request.prefill_context,
             copy_prompt_token_ids_to_all=not (
-                request.prefill_context is not None
-                and request.prefill_context.kind == "streaming"
+                request.is_streaming_prompt
+                or (
+                    request.prefill_context is not None
+                    and request.prefill_context.kind == "streaming"
+                )
             ),
+            is_streaming_prompt=request.is_streaming_prompt,
+            is_streaming_prompt_finished=request.is_streaming_prompt_finished,
+            is_prompt_update=request.is_prompt_update,
         )
 
     @classmethod
@@ -328,6 +350,186 @@ class Request:
             )
             for feature in features
         )
+
+    def start_streaming_anchor(self, *, is_final: bool = False) -> None:
+        """Mark this request as an open, append-only streaming anchor."""
+
+        if self.prompt_token_ids is None or self.prompt_embeds is not None:
+            raise ValueError(
+                "Streaming anchors require prompt token IDs without prompt embeds"
+            )
+        if self.num_output_tokens or self.num_output_placeholders:
+            raise ValueError("A request cannot become an anchor after decoding")
+        if is_final and not self.prompt_token_ids:
+            raise ValueError("A final streaming prompt chunk must contain tokens")
+        self.is_streaming_anchor = True
+        self.streaming_anchor_open = not is_final
+        self.streaming_anchor_parked = False
+        self.is_streaming_prompt = True
+        self.is_streaming_prompt_finished = is_final
+        self.is_prompt_update = False
+
+    def append_streaming_prompt_chunk(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        is_final: bool = False,
+    ) -> bool:
+        """Append one append-only prompt delta to this physical request.
+
+        Multimodal positions in an EngineCore delta are relative to the delta
+        prompt. They are rebased onto the current cumulative prompt before the
+        existing full-snapshot update path validates and publishes a revision.
+        This preserves the Scheduler/worker revision protocol used by Omni.
+        """
+
+        if not self.is_streaming_anchor:
+            raise ValueError("Request is not a streaming anchor")
+        if not self.streaming_anchor_open:
+            raise ValueError("Streaming anchor is already closed")
+        if self.prompt_token_ids is None:
+            raise ValueError("Streaming anchors require prompt token IDs")
+        if is_final and not prompt_token_ids:
+            raise ValueError("A final streaming prompt chunk must contain tokens")
+
+        old_num_prompt_tokens = self.num_prompt_tokens
+        delta_num_prompt_tokens = len(prompt_token_ids)
+        rebased_features: list[MultiModalFeatureSpec] = []
+        previous_offset = -1
+        for feature in mm_features or ():
+            position = feature.mm_position
+            if position.offset < 0 or position.length < 0:
+                raise ValueError(
+                    "Streaming delta multimodal positions must be non-negative"
+                )
+            if position.offset < previous_offset:
+                raise ValueError(
+                    "Streaming delta multimodal features must be ordered by offset"
+                )
+            if position.offset + position.length > delta_num_prompt_tokens:
+                raise ValueError(
+                    "Streaming delta multimodal placeholder exceeds the delta prompt"
+                )
+            rebased_feature = copy(feature)
+            rebased_feature.mm_position = replace(
+                position,
+                offset=old_num_prompt_tokens + position.offset,
+            )
+            rebased_features.append(rebased_feature)
+            previous_offset = position.offset
+
+        cumulative_prompt_token_ids = self.prompt_token_ids + prompt_token_ids
+        cumulative_mm_features = self.mm_features + rebased_features
+        return self.update_streaming_anchor(
+            prompt_token_ids=cumulative_prompt_token_ids,
+            mm_features=cumulative_mm_features,
+            is_final=is_final,
+        )
+
+    def update_streaming_anchor(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        is_final: bool = False,
+    ) -> bool:
+        """Apply one complete cumulative prompt snapshot.
+
+        The token sequence and multimodal feature sequence are append-only. The
+        method accepts full snapshots so an upper layer can coalesce arbitrary
+        numbers of arrivals before updating the physical request. It returns
+        whether prompt data changed. A final update must append tokens so a
+        terminal sample can be scheduled; retire an idle lane explicitly.
+        """
+
+        if not self.is_streaming_anchor:
+            raise ValueError("Request is not a streaming anchor")
+        if not self.streaming_anchor_open:
+            raise ValueError("Streaming anchor is already closed")
+        if self.prompt_token_ids is None or self.prompt_embeds is not None:
+            raise ValueError(
+                "Streaming anchors require prompt token IDs without prompt embeds"
+            )
+        if self.num_output_tokens or self.num_output_placeholders:
+            raise ValueError("Streaming anchors cannot be extended after decoding")
+
+        old_prompt_token_ids = self.prompt_token_ids
+        old_num_prompt_tokens = len(old_prompt_token_ids)
+        if is_final and len(prompt_token_ids) <= old_num_prompt_tokens:
+            raise ValueError("A final streaming prompt chunk must contain tokens")
+        if (
+            len(prompt_token_ids) < old_num_prompt_tokens
+            or prompt_token_ids[:old_num_prompt_tokens] != old_prompt_token_ids
+        ):
+            raise ValueError(
+                "Streaming prompt update must preserve the complete token prefix"
+            )
+
+        cumulative_mm_features = mm_features or []
+        old_num_mm_features = len(self.mm_features)
+        if len(cumulative_mm_features) < old_num_mm_features:
+            raise ValueError(
+                "Streaming prompt update cannot remove multimodal features"
+            )
+        if self._mm_feature_identity(
+            cumulative_mm_features[:old_num_mm_features]
+        ) != self._mm_feature_identity(self.mm_features):
+            raise ValueError(
+                "Streaming prompt update must preserve the multimodal prefix"
+            )
+
+        appended_mm_features = cumulative_mm_features[old_num_mm_features:]
+        previous_offset = (
+            self.mm_features[-1].mm_position.offset if self.mm_features else -1
+        )
+        for feature in appended_mm_features:
+            position = feature.mm_position
+            if position.offset < old_num_prompt_tokens:
+                raise ValueError(
+                    "New multimodal features cannot modify the existing prompt"
+                )
+            if position.offset < previous_offset:
+                raise ValueError("Multimodal features must be ordered by offset")
+            if position.offset + position.length > len(prompt_token_ids):
+                raise ValueError(
+                    "Multimodal feature placeholder exceeds the prompt snapshot"
+                )
+            previous_offset = position.offset
+
+        prompt_changed = (
+            len(prompt_token_ids) != old_num_prompt_tokens
+            or bool(appended_mm_features)
+        )
+        if prompt_changed:
+            appended_token_ids = prompt_token_ids[old_num_prompt_tokens:]
+            self.prompt_token_ids.extend(appended_token_ids)
+            if not self._all_token_ids_shares_prompt:
+                self._all_token_ids.extend(appended_token_ids)
+            self.num_prompt_tokens = len(self.prompt_token_ids)
+
+            self.mm_features.extend(copy(feature) for feature in appended_mm_features)
+            self.num_encoder_inputs = len(self.mm_features)
+            self.has_encoder_inputs = self.num_encoder_inputs > 0
+
+            if self.get_hash_new_full_blocks is not None:
+                if self.mm_features:
+                    # The stock incremental hasher assumes tokens appended after
+                    # the prompt are generated tokens and begins at the last MM
+                    # feature. A streaming prompt can append several new MM
+                    # features, so recompute to retain correct prefix identity.
+                    self.block_hashes.clear()
+                self.block_hashes.extend(self.get_hash_new_full_blocks())
+
+            self.prompt_revision += 1
+            self.streaming_anchor_parked = False
+
+        if is_final:
+            self.streaming_anchor_open = False
+            self.streaming_anchor_parked = False
+            self.is_streaming_prompt_finished = True
+
+        return prompt_changed
 
     def append_output_token_ids(
         self,

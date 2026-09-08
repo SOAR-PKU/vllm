@@ -169,6 +169,19 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         self.output_handler: asyncio.Task | None = None
+        # Front-end lifecycle validation for append-only native
+        # streaming prompts. EngineCore remains the physical admission owner;
+        # these sets only reject duplicate OPEN/FINISH and out-of-order APPEND
+        # calls before they cross the process boundary.
+        self._streaming_prompt_open_request_ids: set[str] = set()
+        self._streaming_prompt_finished_request_ids: set[str] = set()
+        self._streaming_prompt_context_by_request: dict[
+            str, tuple[int, int] | None
+        ] = {}
+        self._streaming_prompt_request_ids_by_context: dict[
+            tuple[int, int], set[str]
+        ] = {}
+        self._retired_streaming_prompt_contexts: set[tuple[int, int]] = set()
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -403,6 +416,227 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
 
+    @staticmethod
+    def _streaming_prompt_context_key(
+        prefill_context: PrefillContextMetadata | None,
+    ) -> tuple[int, int] | None:
+        if prefill_context is None:
+            return None
+        if prefill_context.kind != "streaming":
+            raise ValueError(
+                "Streaming prompt chunks require prefill_context.kind='streaming'"
+            )
+        return (
+            prefill_context.router_session_id,
+            prefill_context.context_lifetime_id,
+        )
+
+    def _ensure_streaming_prompt_frontend_state(self) -> None:
+        """Initialize lifecycle state for lightweight test/legacy instances."""
+
+        if not hasattr(self, "_streaming_prompt_open_request_ids"):
+            self._streaming_prompt_open_request_ids = set()
+            self._streaming_prompt_finished_request_ids = set()
+            self._streaming_prompt_context_by_request = {}
+            self._streaming_prompt_request_ids_by_context = {}
+            self._retired_streaming_prompt_contexts = set()
+
+    def _forget_streaming_prompt_frontend_request(
+        self,
+        request_id: str,
+        *,
+        mark_finished: bool,
+    ) -> None:
+        self._streaming_prompt_open_request_ids.discard(request_id)
+        if mark_finished:
+            self._streaming_prompt_finished_request_ids.add(request_id)
+        context = self._streaming_prompt_context_by_request.pop(request_id, None)
+        if context is None:
+            return
+        request_ids = self._streaming_prompt_request_ids_by_context.get(context)
+        if request_ids is None:
+            return
+        request_ids.discard(request_id)
+        if not request_ids:
+            self._streaming_prompt_request_ids_by_context.pop(context, None)
+
+    async def add_streaming_prompt_chunk(
+        self,
+        prompt: EngineCoreRequest | PromptType,
+        params: SamplingParams,
+        request_id: str,
+        *,
+        is_first_chunk: bool,
+        is_final_chunk: bool = False,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 1,
+        data_parallel_rank: int | None = None,
+        prompt_text: str | None = None,
+        prefill_context: PrefillContextMetadata | None = None,
+    ) -> int:
+        """Submit one native append-only streaming-prompt chunk.
+
+        The first call creates one Scheduler request using ``request_id``.
+        Later calls send only the Processor-produced token/MM delta; EngineCore
+        appends it to that same Request. Non-final chunks deliberately bypass
+        OutputProcessor and have no per-version completion. The return value is
+        the number of prompt tokens accepted by this call, not a cumulative
+        prompt length and not a physical-prefill acknowledgement.
+
+        Multimodal placeholder offsets are delta-local. EngineCore rebases them
+        onto the cumulative prompt before publishing a full worker snapshot.
+        """
+
+        if self.errored:
+            raise EngineDeadError()
+        # Start the global drain loop for OPEN/APPEND too. Those
+        # chunks have no per-request OutputProcessor state, but EngineCore's
+        # empty/stat outputs must still be consumed so the IPC queue cannot
+        # become the backlog boundary.
+        self._run_output_handler()
+        if not isinstance(is_first_chunk, bool):
+            raise TypeError("is_first_chunk must be a boolean")
+        if not isinstance(is_final_chunk, bool):
+            raise TypeError("is_final_chunk must be a boolean")
+        if params.n != 1:
+            raise ValueError("Streaming prompt chunks require SamplingParams.n == 1")
+
+        self._ensure_streaming_prompt_frontend_state()
+        context_key = self._streaming_prompt_context_key(prefill_context)
+        open_request_ids = self._streaming_prompt_open_request_ids
+        finished_request_ids = self._streaming_prompt_finished_request_ids
+
+        if is_first_chunk:
+            if request_id in open_request_ids:
+                raise ValueError(f"Streaming prompt {request_id!r} is already open")
+            if request_id in finished_request_ids:
+                raise ValueError(f"Streaming prompt {request_id!r} already finished")
+            if context_key in self._retired_streaming_prompt_contexts:
+                raise ValueError(
+                    "Cannot open a streaming prompt for a retired context: "
+                    f"request_id={request_id!r}, context={context_key}"
+                )
+        else:
+            if request_id not in open_request_ids:
+                raise ValueError(
+                    f"Streaming prompt append has no open anchor: {request_id!r}"
+                )
+            expected_context_key = self._streaming_prompt_context_by_request.get(
+                request_id
+            )
+            if context_key != expected_context_key:
+                raise ValueError(
+                    "Streaming prompt append changed context identity: "
+                    f"request_id={request_id!r}, expected={expected_context_key}, "
+                    f"received={context_key}"
+                )
+
+        if isinstance(prompt, EngineCoreRequest):
+            request = prompt
+            if request.request_id != request_id:
+                raise ValueError(
+                    "EngineCoreRequest request_id does not match the streaming "
+                    f"request_id: {request.request_id!r} != {request_id!r}"
+                )
+        else:
+            request = self.processor.process_inputs(
+                request_id,
+                prompt,
+                params,
+                arrival_time,
+                lora_request,
+                tokenization_kwargs,
+                trace_headers,
+                priority,
+                data_parallel_rank,
+                prefill_context,
+            )
+            if isinstance(prompt, str):
+                prompt_text = prompt
+            elif isinstance(prompt, Mapping):
+                prompt_text = cast(str | None, prompt.get("prompt"))
+
+        prompt_token_ids = request.prompt_token_ids
+        if prompt_token_ids is None or request.prompt_embeds is not None:
+            raise ValueError(
+                "Streaming prompt chunks require token IDs without prompt embeds"
+            )
+        num_delta_tokens = len(prompt_token_ids)
+        if num_delta_tokens == 0:
+            raise ValueError(
+                "A streaming prompt chunk cannot be empty; retire idle lanes explicitly"
+            )
+
+        previous_mm_offset = -1
+        for feature in request.mm_features or ():
+            position = feature.mm_position
+            if position.offset < 0 or position.length < 0:
+                raise ValueError(
+                    "Streaming delta multimodal positions must be non-negative"
+                )
+            if position.offset < previous_mm_offset:
+                raise ValueError(
+                    "Streaming delta multimodal features must be ordered by offset"
+                )
+            if position.offset + position.length > num_delta_tokens:
+                raise ValueError(
+                    "Streaming delta multimodal placeholder exceeds the delta prompt"
+                )
+            previous_mm_offset = position.offset
+
+        request.is_streaming_prompt = True
+        request.is_streaming_prompt_finished = is_final_chunk
+        # False selects append mode. Full-prompt replacement/LCP
+        # invalidation is intentionally outside this primitive.
+        request.is_prompt_update = False
+
+        output_registered = False
+        if is_final_chunk:
+            # OPEN/APPEND are invisible to the
+            # OutputProcessor; FINISH installs exactly one terminal collector.
+            queue = RequestOutputCollector(output_kind=params.output_kind)
+            self.output_processor.add_request(
+                request,
+                prompt_text,
+                None,
+                0,
+                queue,
+            )
+            output_registered = True
+
+        try:
+            await self.engine_core.add_request_async(request)
+        except BaseException:
+            if output_registered:
+                self.output_processor.abort_requests((request_id,))
+            raise
+
+        if is_first_chunk:
+            open_request_ids.add(request_id)
+            self._streaming_prompt_context_by_request[request_id] = context_key
+            if context_key is not None:
+                self._streaming_prompt_request_ids_by_context.setdefault(
+                    context_key, set()
+                ).add(request_id)
+        if is_final_chunk:
+            open_request_ids.discard(request_id)
+            finished_request_ids.add(request_id)
+
+        if self.log_requests:
+            lifecycle = "OPEN" if is_first_chunk else "APPEND"
+            if is_final_chunk:
+                lifecycle += "+FINISH"
+            logger.info(
+                "Accepted streaming prompt %s for %s (%d delta tokens).",
+                lifecycle,
+                request_id,
+                num_delta_tokens,
+            )
+        return num_delta_tokens
+
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
     # requests we don't need to send multiple messages to core proc,
@@ -560,11 +794,7 @@ class AsyncLLM(EngineClient):
                             outputs_slice,
                             outputs.timestamp,
                             iteration_stats,
-                            (
-                                outputs.logical_request_completions
-                                if i == 0
-                                else None
-                            ),
+                            (outputs.logical_request_completions if i == 0 else None),
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
@@ -602,8 +832,22 @@ class AsyncLLM(EngineClient):
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
+        self._ensure_streaming_prompt_frontend_state()
+        native_request_ids = set(request_ids).intersection(
+            self._streaming_prompt_open_request_ids
+        )
         all_request_ids = self.output_processor.abort_requests(request_ids)
+        all_request_ids.extend(
+            request_id
+            for request_id in native_request_ids
+            if request_id not in all_request_ids
+        )
         await self.engine_core.abort_requests_async(all_request_ids)
+        for native_request_id in native_request_ids:
+            self._forget_streaming_prompt_frontend_request(
+                native_request_id,
+                mark_finished=True,
+            )
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
@@ -620,6 +864,21 @@ class AsyncLLM(EngineClient):
             router_session_id,
             context_lifetime_id,
         )
+        self._ensure_streaming_prompt_frontend_state()
+        context = (router_session_id, context_lifetime_id)
+        self._retired_streaming_prompt_contexts.add(context)
+        request_ids = tuple(
+            self._streaming_prompt_request_ids_by_context.get(context, ())
+        )
+        if request_ids:
+            # OPEN/APPEND never registered with OutputProcessor; this is a
+            # no-op for them and cleans a rare FINISH racing with retire.
+            self.output_processor.abort_requests(request_ids)
+        for request_id in request_ids:
+            self._forget_streaming_prompt_frontend_request(
+                request_id,
+                mark_finished=True,
+            )
 
     async def preempt_to_lmcache(
         self,

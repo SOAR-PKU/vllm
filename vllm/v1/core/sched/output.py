@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,28 @@ else:
     Request = object
 
 
+@dataclass(slots=True)
+class MutableRequestData:
+    """Complete prompt snapshot for an already cached mutable request."""
+
+    revision: int
+    prompt_token_ids: list[int]
+    mm_features: list[MultiModalFeatureSpec]
+
+    @classmethod
+    def from_request(cls, request: Request) -> "MutableRequestData":
+        prompt_token_ids = request.prompt_token_ids
+        if prompt_token_ids is None:
+            raise ValueError("Mutable requests require prompt token IDs")
+        return cls(
+            revision=request.prompt_revision,
+            prompt_token_ids=prompt_token_ids.copy(),
+            # A worker-side MM cache fills ``feature.data`` in place. Shallow
+            # copies keep that materialization from mutating scheduler state.
+            mm_features=[copy(feature) for feature in request.mm_features],
+        )
+
+
 @bc_linter_include
 @dataclass
 class NewRequestData:
@@ -43,6 +66,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    prompt_revision: int = 0
 
     @classmethod
     def from_request(
@@ -52,14 +76,23 @@ class NewRequestData:
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
-            mm_features=request.mm_features,
+            prompt_token_ids=(
+                request.prompt_token_ids.copy()
+                if request.is_streaming_anchor and request.prompt_token_ids is not None
+                else request.prompt_token_ids
+            ),
+            mm_features=(
+                [copy(feature) for feature in request.mm_features]
+                if request.is_streaming_anchor
+                else request.mm_features
+            ),
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            prompt_revision=request.prompt_revision,
         )
 
     def __repr__(self) -> str:
@@ -114,6 +147,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # Full snapshots, rather than deltas, make skipped revisions harmless and
+    # let every worker independently replace its cached prompt state.
+    prompt_updates: dict[str, MutableRequestData] = field(default_factory=dict)
 
     @property
     def num_reqs(self) -> int:
@@ -142,6 +178,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            prompt_updates={},
         )
 
 
@@ -182,6 +219,16 @@ class SchedulerOutput:
     # list of mm_hash strings associated with the encoder outputs to be
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
+
+    # Open-anchor state captured before this iteration advances scheduler
+    # progress. A later append must not turn this iteration's dummy sample into
+    # a real output token.
+    streaming_anchor_snapshots: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    # Optional on-demand encoder payloads for metadata-only prompt snapshots.
+    # None preserves the legacy full-payload path; an empty dict means that
+    # this dispatch intentionally carries no encoder payloads.
+    scheduled_mm_features: dict[str, dict[int, MultiModalFeatureSpec]] | None = None
 
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.

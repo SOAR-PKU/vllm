@@ -36,6 +36,7 @@ from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    MutableRequestData,
     NewRequestData,
     SchedulerOutput,
 )
@@ -388,15 +389,45 @@ class Scheduler(SchedulerInterface):
             return None
 
         target_rank = (target.priority, target.arrival_time)
-        scheduled_req_ids = {
-            request.request_id for request in scheduled_running_reqs
-        }
+        scheduled_req_ids = {request.request_id for request in scheduled_running_reqs}
         candidates = (
             request
             for request in self.running
             if request.status == RequestStatus.RUNNING
             and request.request_id not in scheduled_req_ids
             and (request.priority, request.arrival_time) > target_rank
+            and not self._is_recovery_protected(request)
+        )
+        return max(
+            candidates,
+            key=lambda request: (request.priority, request.arrival_time),
+            default=None,
+        )
+
+    def _get_parked_priority_admission_victim(
+        self,
+        target: Request,
+        scheduled_running_reqs: list[Request],
+    ) -> Request | None:
+        """Reclaim an idle mutable anchor's slot for waiting work.
+
+        A parked anchor deliberately stays in ``running`` to retain its KV
+        allocation, but it must not consume the last sequence slot forever.
+        Restricting this exception to parked streaming anchors preserves the
+        ordinary vLLM admission behavior for every other request type.
+        """
+        scheduled_req_ids = {request.request_id for request in scheduled_running_reqs}
+        candidates = (
+            request
+            for request in self.running
+            if request.status == RequestStatus.RUNNING
+            and request.is_streaming_anchor
+            and request.streaming_anchor_parked
+            and request.request_id not in scheduled_req_ids
+            and (
+                self.policy != SchedulingPolicy.PRIORITY
+                or request.priority >= target.priority
+            )
             and not self._is_recovery_protected(request)
         )
         return max(
@@ -415,6 +446,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.streaming_anchor_parked = False
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(
@@ -473,7 +505,6 @@ class Scheduler(SchedulerInterface):
                 and self.waiting
                 and not self.remote_kv_ready_interrupt
                 and not self.interrupt_waiting
-                and len(self.running) < self.max_num_running_reqs
                 and not self._is_recovery_protected(request)
             ):
                 waiting_request = self.waiting.peek_request()
@@ -485,6 +516,13 @@ class Scheduler(SchedulerInterface):
                         waiting_request.arrival_time,
                     )
                     < (request.priority, request.arrival_time)
+                    and (
+                        len(self.running) < self.max_num_running_reqs
+                        or self._get_parked_priority_admission_victim(
+                            waiting_request, scheduled_running_reqs
+                        )
+                        is not None
+                    )
                 ):
                     priority_admission_request = waiting_request
                     break
@@ -655,12 +693,40 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while (
-                self.remote_kv_ready_interrupt
-                or self.interrupt_waiting
-                or self.waiting
+                self.remote_kv_ready_interrupt or self.interrupt_waiting or self.waiting
             ) and token_budget > 0:
+                if (
+                    not self.remote_kv_ready_interrupt
+                    and not self.interrupt_waiting
+                    and self.waiting
+                    and (
+                        waiting_head := self.waiting.peek_request()
+                    ).is_streaming_anchor
+                    and waiting_head.streaming_anchor_parked
+                ):
+                    # A reclaimed idle lane remains dormant without KV until
+                    # APPEND publishes more work. Do not recompute old work.
+                    skipped_waiting_requests.prepend_request(self.waiting.pop_request())
+                    continue
                 if len(self.running) == self.max_num_running_reqs:
-                    break
+                    parked_victim = None
+                    if (
+                        not self.remote_kv_ready_interrupt
+                        and not self.interrupt_waiting
+                        and self.waiting
+                    ):
+                        parked_victim = self._get_parked_priority_admission_victim(
+                            self.waiting.peek_request(), scheduled_running_reqs
+                        )
+                    if parked_victim is None:
+                        break
+                    self.running.remove(parked_victim)
+                    self._preempt_request(parked_victim, scheduled_timestamp)
+                    parked_victim.streaming_anchor_parked = True
+                    preempted_reqs.append(parked_victim)
+                    # Preemption reinserted the dormant victim into waiting;
+                    # skip it before choosing the runnable admission target.
+                    continue
 
                 if self.remote_kv_ready_interrupt:
                     active_waiting = self.remote_kv_ready_interrupt
@@ -1056,6 +1122,8 @@ class Scheduler(SchedulerInterface):
             )
             for req in scheduled_new_reqs
         ]
+        for req, req_data in zip(scheduled_new_reqs, new_reqs_data):
+            req.worker_prompt_revision = req_data.prompt_revision
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
@@ -1069,6 +1137,11 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
+        streaming_anchor_snapshots = {
+            req_id: (request.prompt_revision, request.num_prompt_tokens)
+            for req_id in num_scheduled_tokens
+            if (request := self.requests[req_id]).streaming_anchor_open
+        }
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1083,6 +1156,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            streaming_anchor_snapshots=streaming_anchor_snapshots,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1124,6 +1198,16 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
 
+            anchor_snapshot = scheduler_output.streaming_anchor_snapshots.get(req_id)
+            if anchor_snapshot is not None:
+                revision, prompt_length = anchor_snapshot
+                if (
+                    request.streaming_anchor_open
+                    and request.prompt_revision == revision
+                    and request.num_computed_tokens >= prompt_length
+                ):
+                    request.streaming_anchor_parked = True
+
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
             # decoding. However, it is safe to call the method here because
@@ -1151,6 +1235,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        prompt_updates: dict[str, MutableRequestData] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1183,6 +1268,9 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            if req.prompt_revision > req.worker_prompt_revision:
+                prompt_updates[req_id] = MutableRequestData.from_request(req)
+                req.worker_prompt_revision = req.prompt_revision
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1192,6 +1280,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            prompt_updates=prompt_updates,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1414,6 +1503,10 @@ class Scheduler(SchedulerInterface):
                 sampled_token_ids[req_index].tolist() if sampled_token_ids else []
             )
 
+            # Discard samples from the open prompt snapshot even when APPEND
+            # publishes a newer revision during this model iteration.
+            anchor_snapshot = scheduler_output.streaming_anchor_snapshots.get(req_id)
+
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -1437,6 +1530,16 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
                 )
+
+            if anchor_snapshot is not None:
+                generated_token_ids = []
+                revision, prompt_length = anchor_snapshot
+                if (
+                    request.streaming_anchor_open
+                    and request.prompt_revision == revision
+                    and request.num_computed_tokens >= prompt_length
+                ):
+                    request.streaming_anchor_parked = True
 
             stopped = False
             new_logprobs = None
@@ -1833,6 +1936,8 @@ class Scheduler(SchedulerInterface):
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:
+        """Count live requests, including open parked streaming anchors."""
+
         return (
             len(self.waiting)
             + len(self.interrupt_waiting)
@@ -1840,6 +1945,29 @@ class Scheduler(SchedulerInterface):
             + len(self.running)
             + len(self.offloading)
             + len(self.remote_kv_loading)
+        )
+
+    def has_requests(self) -> bool:
+        """Whether the next EngineCore iteration has scheduler work.
+
+        Open anchors that have reached their current prompt frontier remain
+        unfinished and keep their KV allocation, but they have no executable
+        tokens until an append arrives. Ignoring those parked anchors here lets
+        EngineCore block on its input queue instead of producing empty steps.
+        """
+
+        if self.has_finished_requests() or self.offloading or self.remote_kv_loading:
+            return True
+
+        requests = itertools.chain(
+            self.running,
+            self.waiting,
+            self.interrupt_waiting,
+            self.remote_kv_ready_interrupt,
+        )
+        return any(
+            not (request.is_streaming_anchor and request.streaming_anchor_parked)
+            for request in requests
         )
 
     def has_finished_requests(self) -> bool:
@@ -2108,6 +2236,9 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens - request.num_cached_tokens
                     )
                     request.num_computed_tokens = request.num_cached_tokens
+
+                if request.num_computed_tokens < request.num_tokens:
+                    request.streaming_anchor_parked = False
 
                 affected_req_ids.add(request.request_id)
 

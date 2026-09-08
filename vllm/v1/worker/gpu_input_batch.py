@@ -45,6 +45,7 @@ class CachedRequestState:
 
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
+    prompt_revision: int = 0
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

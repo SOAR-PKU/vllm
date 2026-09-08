@@ -94,6 +94,14 @@ class EngineCoreRequest(
     # vLLM admission path.
     prefill_context: PrefillContextMetadata | None = None
 
+    # Append-only input-streaming lifecycle flags. The first request
+    # carries the initial prompt. Later requests with the same request_id carry
+    # only a prompt/MM delta and update the existing scheduler Request in place.
+    is_streaming_prompt: bool = False
+    is_streaming_prompt_finished: bool = False
+    # Full-prompt replacement is reserved; lanes support append mode only.
+    is_prompt_update: bool = False
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""

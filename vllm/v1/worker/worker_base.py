@@ -25,6 +25,7 @@ from vllm.v1.worker.mm_feature_prefetch import (
 )
 
 if TYPE_CHECKING:
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 else:
@@ -210,9 +211,7 @@ class WorkerWrapperBase:
 
         # `model_config` can be None in tests
         model_config = vllm_config.model_config
-        mm_config = (
-            None if model_config is None else model_config.multimodal_config
-        )
+        mm_config = None if model_config is None else model_config.multimodal_config
         self.mm_feature_prefetch_cache = (
             WorkerMMFeaturePrefetchCache(
                 int(mm_config.mm_processor_cache_gb * GiB_bytes)
@@ -368,39 +367,46 @@ class WorkerWrapperBase:
         return getattr(self.worker, attr)
 
     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:
+        scheduled_features = getattr(scheduler_output, "scheduled_mm_features", None)
+        if scheduled_features is not None:
+            # Prompt snapshots contain position metadata, not encoder payloads.
+            for features in scheduled_features.values():
+                indices = list(features)
+                materialized = self._materialize_mm_features(list(features.values()))
+                features.update(zip(indices, materialized))
+            return
+
+        mm_request_data: list[Any] = list(scheduler_output.scheduled_new_reqs)
+        cached_req_data = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_req_data is not None:
+            mm_request_data.extend(cached_req_data.prompt_updates.values())
+
+        for req_data in mm_request_data:
+            req_data.mm_features = self._materialize_mm_features(req_data.mm_features)
+
+    def _materialize_mm_features(
+        self, mm_features: list["MultiModalFeatureSpec"]
+    ) -> list["MultiModalFeatureSpec"]:
         prefetched_cache = self.mm_feature_prefetch_cache
-        if prefetched_cache is not None:
-            for req_data in scheduler_output.scheduled_new_reqs:
-                if not any(
-                    feature.data is None for feature in req_data.mm_features
-                ):
-                    continue
-                with record_function_or_nullcontext(
-                    "worker: mm_feature_prefetch_materialize"
-                ):
-                    prefetched_cache.materialize_features(
-                        req_data.mm_features
-                    )
-
-        mm_cache = self.mm_receiver_cache
-        if mm_cache is not None:
-            for req_data in scheduler_output.scheduled_new_reqs:
-                req_data.mm_features = mm_cache.get_and_update_features(
-                    req_data.mm_features
-                )
-
-        for req_data in scheduler_output.scheduled_new_reqs:
-            unresolved = [
-                feature.identifier
-                for feature in req_data.mm_features
-                if feature.data is None
-            ]
-            if unresolved:
-                raise MMFeaturePrefetchProtocolError(
-                    "SchedulerOutput contains unresolved multimodal feature "
-                    "references after both the custom prefetch cache and "
-                    f"native receiver cache were applied: {unresolved!r}"
-                )
+        if prefetched_cache is not None and any(
+            feature.data is None for feature in mm_features
+        ):
+            with record_function_or_nullcontext(
+                "worker: mm_feature_prefetch_materialize"
+            ):
+                prefetched_cache.materialize_features(mm_features)
+        if self.mm_receiver_cache is not None:
+            mm_features = self.mm_receiver_cache.get_and_update_features(mm_features)
+        unresolved = [
+            feature.identifier for feature in mm_features if feature.data is None
+        ]
+        if unresolved:
+            raise MMFeaturePrefetchProtocolError(
+                "SchedulerOutput contains unresolved multimodal feature "
+                "references after both the custom prefetch cache and "
+                f"native receiver cache were applied: {unresolved!r}"
+            )
+        return mm_features
 
     def cache_prefetched_mm_feature(
         self,
@@ -411,11 +417,7 @@ class WorkerWrapperBase:
         """Store one item received by the worker's prefetch thread."""
 
         cache = self.mm_feature_prefetch_cache
-        return (
-            False
-            if cache is None
-            else cache.put(identifier, generation, data)
-        )
+        return False if cache is None else cache.put(identifier, generation, data)
 
     def release_prefetched_mm_feature(
         self,
@@ -425,11 +427,7 @@ class WorkerWrapperBase:
         """Release one exact feature generation for LRU eviction."""
 
         cache = self.mm_feature_prefetch_cache
-        return (
-            False
-            if cache is None
-            else cache.release(identifier, generation)
-        )
+        return False if cache is None else cache.release(identifier, generation)
 
     def execute_model(
         self,

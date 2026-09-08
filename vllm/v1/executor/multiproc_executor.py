@@ -9,10 +9,11 @@ import threading
 import time
 import traceback
 import weakref
+from _thread import LockType as ThreadLockType
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
@@ -73,19 +74,94 @@ class FutureWrapper(Future):
         self,
         futures_queue: deque[tuple["FutureWrapper", Callable]],
         aggregate: Callable = lambda x: x,
+        response_lock: ThreadLockType | None = None,
+        cancel_response: Callable[[], None] | None = None,
     ):
         self.futures_queue = futures_queue
         self.aggregate = aggregate
+        self.response_lock = (
+            response_lock if response_lock is not None else threading.Lock()
+        )
+        self.cancel_response = cancel_response
         super().__init__()
 
     def result(self, timeout=None):
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
-        # Drain any futures ahead of us in the queue.
-        while not self.done():
-            future, get_response = self.futures_queue.pop()
-            future.wait_for_response(get_response)
+        if not self.done():
+            with self._response_reader():
+                # Drain any futures ahead of us in the queue.
+                while not self.done():
+                    future, get_response = self.futures_queue.pop()
+                    future.wait_for_response(get_response)
         return super().result()
+
+    @contextmanager
+    def _response_reader(self):
+        if not self.response_lock.acquire(blocking=False):
+            raise RuntimeError("Executor RPC responses already have an active reader.")
+        try:
+            yield
+        finally:
+            self.response_lock.release()
+
+    def result_with_callback(
+        self,
+        callback: Callable[[], None],
+        poll_interval_s: float = 0.002,
+    ) -> Any:
+        """Wait for RPC results while the caller performs bounded local work.
+
+        Only response I/O runs in the helper thread. Aggregation, future
+        completion, and the callback run on the calling thread. The callback
+        must not issue executor RPCs or wait on another queued future.
+        """
+        if not 0 < poll_interval_s < float("inf"):
+            raise ValueError("poll_interval_s must be positive and finite")
+        if not self.done():
+            with self._response_reader():
+                while not self.done():
+                    future, get_response = self.futures_queue.pop()
+                    future._wait_for_response_with_callback(
+                        get_response, callback, poll_interval_s
+                    )
+        return super().result()
+
+    def _wait_for_response_with_callback(
+        self,
+        get_response: Callable,
+        callback: Callable[[], None],
+        poll_interval_s: float,
+    ) -> None:
+        response: Future = Future()
+        response_ready = threading.Event()
+
+        def read_response() -> None:
+            try:
+                # Read the entire RPC exactly once, including all TP ranks.
+                response.set_result(get_response())
+            except BaseException as exc:
+                response.set_exception(exc)
+            finally:
+                response_ready.set()
+
+        reader = Thread(target=read_response, name="vllm-rpc-response", daemon=True)
+        reader.start()
+        try:
+            while not response_ready.wait(poll_interval_s):
+                if not response_ready.is_set():
+                    callback()
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and self.cancel_response is not None:
+                # Signal-driven Core exit cannot reach executor.shutdown until
+                # this wait unwinds. Cancel queue I/O before joining its reader.
+                self.cancel_response()
+            raise
+        finally:
+            # Even a failed callback must leave no active reader or unread RPC.
+            # The reader retains existing RPC deadlines and queue cancellation.
+            reader.join()
+            self.wait_for_response(response.result)
 
     def wait_for_response(self, get_response: Callable):
         try:
@@ -278,6 +354,7 @@ class MultiprocExecutor(Executor):
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
 
         self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
+        self._response_lock = threading.Lock()
 
         self.output_rank = self._get_output_rank()
 
@@ -512,6 +589,33 @@ class MultiprocExecutor(Executor):
         unique_reply_rank: int | None = None,
         kv_output_aggregator: KVOutputAggregator = None,
     ) -> Any | list[Any] | Future[Any | list[Any]]:
+        # Reject reentrant RPCs before broadcasting them. A cooperative wait
+        # already owns the response stream, even though its reader is a helper.
+        if not self._response_lock.acquire(blocking=False):
+            raise RuntimeError("Executor RPC responses already have an active reader.")
+        try:
+            return self._collective_rpc(
+                method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                non_block=non_block,
+                unique_reply_rank=unique_reply_rank,
+                kv_output_aggregator=kv_output_aggregator,
+            )
+        finally:
+            self._response_lock.release()
+
+    def _collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: KVOutputAggregator = None,
+    ) -> Any | list[Any] | Future[Any | list[Any]]:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
         is provided, otherwise list."""
         assert self.rpc_broadcast_mq is not None, (
@@ -565,7 +669,12 @@ class MultiprocExecutor(Executor):
             return responses[0] if output_rank is not None else responses
 
         if non_block:
-            future = FutureWrapper(self.futures_queue, aggregate=aggregate)
+            future = FutureWrapper(
+                self.futures_queue,
+                aggregate=aggregate,
+                response_lock=self._response_lock,
+                cancel_response=self.shutdown_event.set,
+            )
             self.futures_queue.appendleft((future, get_response))
             return future
 

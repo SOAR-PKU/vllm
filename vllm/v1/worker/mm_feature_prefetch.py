@@ -35,6 +35,9 @@ MM_FEATURE_PREFETCH_CONFIG_KEY = (
 MM_FEATURE_PREFETCH_HORIZON_CHUNKS_CONFIG_KEY = (
     "llm_rtc_mm_feature_prefetch_horizon_chunks"
 )
+MM_FEATURE_REFERENCE_DISPATCH_CONFIG_KEY = (
+    "llm_rtc_mm_feature_reference_dispatch_enabled"
+)
 
 
 @dataclass(slots=True)

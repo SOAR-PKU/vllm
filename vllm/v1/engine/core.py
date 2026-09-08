@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
 import queue
 import signal
@@ -10,7 +11,7 @@ from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
-from logging import DEBUG
+from logging import DEBUG, INFO
 from typing import Any, TypeVar, cast
 
 import msgspec
@@ -65,6 +66,7 @@ from vllm.v1.engine.coordinator_metrics import (
     EngineCoreInstrumentationConfig,
     thread_cpu_time_ns,
 )
+from vllm.v1.engine.lane_prefetch import NativeLaneFeaturePrefetch
 from vllm.v1.engine.prefill_coordinator import StreamingPrefillCoordinator
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -87,6 +89,19 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 _MM_FEATURE_PREFETCH_METRICS_INTERVAL_S = 10.0
+_OPTIMIZED_COALESCE_CONFIG_KEY = "optimized_coalesce_enabled"
+_ASYNC_STREAMING_INGEST_CONFIG_KEY = "enginecore_async_streaming_ingest_enabled"
+_ASYNC_STREAMING_INGEST_MAX_MESSAGES = 4
+_ASYNC_STREAMING_INGEST_MAX_TIME_NS = 2_000_000
+_QWEN3_OMNI_MROPE_METADATA_KEYS = frozenset(
+    {
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "audio_feature_lengths",
+        "use_audio_in_video",
+    }
+)
 
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -123,24 +138,18 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
-        instrumentation_config = (
-            EngineCoreInstrumentationConfig.from_vllm_config(vllm_config)
+        instrumentation_config = EngineCoreInstrumentationConfig.from_vllm_config(
+            vllm_config
         )
         self.coordinator_cpu_metrics = EngineCoreCoordinatorMetrics(
             instrumentation_config
         )
-        self._coordinator_cpu_metrics_enabled = (
-            self.coordinator_cpu_metrics.enabled
-        )
+        self._coordinator_cpu_metrics_enabled = self.coordinator_cpu_metrics.enabled
         self._enginecore_input_observability_enabled = (
             instrumentation_config.input_drain_observability_enabled
         )
-        self._input_drain_max_messages = (
-            instrumentation_config.input_drain_max_messages
-        )
-        self._input_drain_max_time_ns = (
-            instrumentation_config.input_drain_max_time_ns
-        )
+        self._input_drain_max_messages = instrumentation_config.input_drain_max_messages
+        self._input_drain_max_time_ns = instrumentation_config.input_drain_max_time_ns
         additional_config = vllm_config.additional_config
         raw_prefetch_horizon = (
             additional_config.get(
@@ -167,6 +176,45 @@ class EngineCore:
                 False,
             )
         )
+        options = additional_config if isinstance(additional_config, dict) else {}
+        optimized = options.get(_OPTIMIZED_COALESCE_CONFIG_KEY, False)
+        async_ingest = options.get(_ASYNC_STREAMING_INGEST_CONFIG_KEY, False)
+        reference_dispatch = options.get(
+            "llm_rtc_mm_feature_reference_dispatch_enabled", True
+        )
+        for key, value in (
+            (_OPTIMIZED_COALESCE_CONFIG_KEY, optimized),
+            (_ASYNC_STREAMING_INGEST_CONFIG_KEY, async_ingest),
+            ("llm_rtc_mm_feature_reference_dispatch_enabled", reference_dispatch),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean")
+        self._optimized_coalesce_enabled = optimized
+        self._async_streaming_ingest_enabled = async_ingest
+        if optimized and (
+            self._direct_streaming_prefill_baseline_enabled
+            or vllm_config.parallel_config.data_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+            or vllm_config.scheduler_config.async_scheduling
+            or vllm_config.speculative_config is not None
+        ):
+            raise ValueError(
+                "Optimized coalescing requires DP=PP=1, synchronous scheduling, "
+                "no speculative decoding, and no direct-prefill baseline"
+            )
+        if async_ingest:
+            from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+            if (
+                not optimized
+                or not issubclass(executor_class, MultiprocExecutor)
+                or not hasattr(self, "_pump_inflight_streaming_appends")
+            ):
+                raise ValueError(
+                    "Async streaming ingest requires optimized coalescing in "
+                    "an EngineCore process with MultiprocExecutor"
+                )
+        self._deferred_inflight_input: tuple[EngineCoreRequestType, Any] | None = None
         if vllm_config.parallel_config.data_parallel_rank == 0:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -257,6 +305,8 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        if optimized and self.batch_queue is not None:
+            raise ValueError("Optimized coalescing requires one in-flight step")
 
         self.ec_producer = (
             vllm_config.ec_transfer_config is not None
@@ -295,16 +345,41 @@ class EngineCore:
                 if self.model_executor.supports_mm_feature_prefetch
                 else None
             ),
-            feature_prefetch_horizon_chunks=(
-                self._mm_feature_prefetch_horizon_chunks
-            ),
+            feature_prefetch_horizon_chunks=(self._mm_feature_prefetch_horizon_chunks),
         )
         # Coordinator hot paths may publish finer-grained categories without
         # expanding its public constructor. The metrics object is a no-op when
         # profiling is disabled.
-        self.streaming_prefill_coordinator.cpu_metrics = (
-            self.coordinator_cpu_metrics
+        self.streaming_prefill_coordinator.cpu_metrics = self.coordinator_cpu_metrics
+        self._lane_feature_prefetch = (
+            NativeLaneFeaturePrefetch(
+                self.streaming_prefill_coordinator.mm_feature_tracker,
+                reference_dispatch=reference_dispatch,
+                snapshot_metadata_keys=(
+                    _QWEN3_OMNI_MROPE_METADATA_KEYS
+                    if getattr(vllm_config.model_config.hf_config, "model_type", None)
+                    in {"qwen3_omni_moe", "qwen3_omni_moe_thinker"}
+                    and getattr(
+                        vllm_config.model_config.multimodal_config,
+                        "mm_processor_cache_type",
+                        None,
+                    )
+                    != "shm"
+                    else None
+                ),
+            )
+            if optimized
+            else None
         )
+        self._ensure_native_streaming_registry()
+        if optimized:
+            logger.info(
+                "Optimized coalescing enabled: append-only lanes, "
+                "async_ingress=%s, mm_reference_dispatch=%s, horizon_chunks=%d",
+                async_ingest,
+                reference_dispatch,
+                raw_prefetch_horizon,
+            )
         # This is deliberately separate from optional CPU profiling. One
         # monotonic-clock check per EngineCore step is enough to leave a useful
         # tuning trail when the benchmark launcher later terminates the stack.
@@ -319,12 +394,8 @@ class EngineCore:
                 time.monotonic() + _MM_FEATURE_PREFETCH_METRICS_INTERVAL_S
             )
         self._deferred_mm_feature_abort_dispatches: set[str] = set()
-        self._direct_prefill_requests_by_context: dict[
-            tuple[int, int], set[str]
-        ] = {}
-        self._direct_prefill_context_by_request: dict[
-            str, tuple[int, int]
-        ] = {}
+        self._direct_prefill_requests_by_context: dict[tuple[int, int], set[str]] = {}
+        self._direct_prefill_context_by_request: dict[str, tuple[int, int]] = {}
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -386,6 +457,207 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def _ensure_native_streaming_registry(self) -> None:
+        """Initialize registry state for lightweight test/legacy instances."""
+
+        if not hasattr(self, "_native_streaming_anchors_by_context"):
+            self._native_streaming_anchors_by_context = {}
+            self._native_streaming_context_by_anchor = {}
+            self._retired_native_streaming_contexts = set()
+
+    @staticmethod
+    def _native_streaming_context_key(
+        request: Request,
+    ) -> tuple[int, int] | None:
+        metadata = request.prefill_context
+        if metadata is None:
+            return None
+        if metadata.kind != "streaming":
+            raise ValueError(
+                "Native streaming prompts require prefill_context.kind='streaming'"
+            )
+        return (metadata.router_session_id, metadata.context_lifetime_id)
+
+    def _handle_native_streaming_prompt(self, request: Request) -> bool:
+        """Create or append one native same-ID append-only lane.
+
+        This branch runs before all StreamingPrefillCoordinator dispatch. The
+        public request ID is therefore also the sole physical Scheduler ID.
+        """
+
+        if not getattr(request, "is_streaming_prompt", False):
+            return False
+        if not getattr(self, "_optimized_coalesce_enabled", False):
+            raise ValueError("Streaming lanes require optimized_coalesce_enabled")
+        if request.is_prompt_update:
+            raise ValueError(
+                "Native streaming-prompt coalescing supports append mode only; "
+                "full-prompt replacement is not enabled"
+            )
+        if request.prompt_token_ids is None or request.prompt_embeds is not None:
+            raise ValueError(
+                "Native streaming prompts require token IDs without prompt embeds"
+            )
+
+        self._ensure_native_streaming_registry()
+        incoming_context = self._native_streaming_context_key(request)
+        scheduler_requests = self.scheduler.requests  # type: ignore[attr-defined]
+        existing = scheduler_requests.get(request.request_id)
+        if existing is not None:
+            if not existing.is_streaming_anchor:
+                raise ValueError(
+                    "Streaming prompt request_id collides with a non-streaming "
+                    f"request: {request.request_id!r}"
+                )
+            expected_context = self._native_streaming_context_by_anchor.get(
+                request.request_id
+            )
+            if expected_context != incoming_context:
+                raise ValueError(
+                    "Streaming prompt append changed context identity: "
+                    f"request_id={request.request_id!r}, "
+                    f"expected={expected_context}, received={incoming_context}"
+                )
+            if (
+                not request.prompt_token_ids
+                and not request.is_streaming_prompt_finished
+            ):
+                raise ValueError("A non-final streaming prompt chunk cannot be empty")
+
+            previous_metadata = existing.prefill_context
+            if (
+                previous_metadata is not None
+                and request.prefill_context is not None
+                and request.prefill_context.context_version
+                <= previous_metadata.context_version
+                and not request.is_streaming_prompt_finished
+            ):
+                raise ValueError("Streaming lane versions must increase strictly")
+            existing.append_streaming_prompt_chunk(
+                prompt_token_ids=request.prompt_token_ids,
+                mm_features=request.mm_features,
+                is_final=request.is_streaming_prompt_finished,
+            )
+            # Context version is observational metadata, not anchor identity.
+            # Retain the newest immutable version after identity validation.
+            if request.prefill_context is not None:
+                existing.prefill_context = request.prefill_context
+            prefetch = getattr(self, "_lane_feature_prefetch", None)
+            if prefetch is not None:
+                prefetch.apply_update(existing, request)
+            self._log_native_streaming_prompt_apply(
+                existing,
+                chunk_kind=(
+                    "APPEND_FINISH"
+                    if request.is_streaming_prompt_finished
+                    else "APPEND"
+                ),
+                delta_tokens=len(request.prompt_token_ids),
+            )
+            return True
+
+        if not request.prompt_token_ids and not request.is_streaming_prompt_finished:
+            raise ValueError("The first streaming prompt chunk cannot be empty")
+        if (
+            incoming_context is not None
+            and incoming_context in self._retired_native_streaming_contexts
+        ):
+            raise ValueError(
+                "Cannot create a native streaming anchor for a retired context: "
+                f"request_id={request.request_id!r}, context={incoming_context}"
+            )
+
+        request.start_streaming_anchor(
+            is_final=request.is_streaming_prompt_finished,
+        )
+        self.scheduler.add_request(request)
+        prefetch = getattr(self, "_lane_feature_prefetch", None)
+        if prefetch is not None:
+            prefetch.apply_update(request, request)
+        if incoming_context is not None:
+            self._native_streaming_anchors_by_context.setdefault(
+                incoming_context, set()
+            ).add(request.request_id)
+            self._native_streaming_context_by_anchor[request.request_id] = (
+                incoming_context
+            )
+        self._log_native_streaming_prompt_apply(
+            request,
+            chunk_kind=(
+                "OPEN_FINISH" if request.is_streaming_prompt_finished else "OPEN"
+            ),
+            delta_tokens=len(request.prompt_token_ids),
+        )
+        return True
+
+    @staticmethod
+    def _log_native_streaming_prompt_apply(
+        request: Request,
+        *,
+        chunk_kind: str,
+        delta_tokens: int,
+    ) -> None:
+        """Emit the Core-apply boundary used by backlog validity audits."""
+
+        if not logger.isEnabledFor(INFO):
+            return
+        metadata = request.prefill_context
+        payload = {
+            "request_id": request.request_id,
+            "router_session_id": (
+                metadata.router_session_id if metadata is not None else None
+            ),
+            "context_lifetime_id": (
+                metadata.context_lifetime_id if metadata is not None else None
+            ),
+            "context_version": (
+                metadata.context_version if metadata is not None else None
+            ),
+            "chunk_kind": chunk_kind,
+            "delta_tokens": delta_tokens,
+            "cumulative_tokens": request.num_prompt_tokens,
+            "prompt_revision": request.prompt_revision,
+            "applied_wall_ns": time.time_ns(),
+        }
+        logger.info(
+            "native_streaming_prompt_apply %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _forget_native_streaming_anchors(
+        self,
+        request_ids: Iterable[str],
+    ) -> None:
+        self._ensure_native_streaming_registry()
+        for request_id in request_ids:
+            context = self._native_streaming_context_by_anchor.pop(request_id, None)
+            if context is None:
+                continue
+            anchors = self._native_streaming_anchors_by_context.get(context)
+            if anchors is None:
+                continue
+            anchors.discard(request_id)
+            if not anchors:
+                self._native_streaming_anchors_by_context.pop(context, None)
+
+    def _finish_native_streaming_outputs(
+        self,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> None:
+        context_by_anchor = getattr(
+            self,
+            "_native_streaming_context_by_anchor",
+            None,
+        )
+        if not context_by_anchor:
+            return
+        self._forget_native_streaming_anchors(
+            output.request_id
+            for outputs in engine_core_outputs.values()
+            for output in outputs.outputs
+            if output.finished and output.request_id in context_by_anchor
+        )
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -414,6 +686,9 @@ class EngineCore:
                 f"request_id must be a string, got {type(request.request_id)}"
             )
 
+        if self._handle_native_streaming_prompt(request):
+            return
+
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
                 task for task in self.get_supported_tasks() if task in POOLING_TASKS
@@ -434,6 +709,17 @@ class EngineCore:
             )
 
         coordinator = self.streaming_prefill_coordinator
+        if getattr(self, "_optimized_coalesce_enabled", False):
+            if request.prefill_context is not None:
+                if request.prefill_context.kind != "user_query":
+                    raise ValueError(
+                        "Optimized streaming contexts require lane updates"
+                    )
+                prefetch = getattr(self, "_lane_feature_prefetch", None)
+                if prefetch is not None:
+                    prefetch.observe_query(request)
+            self.scheduler.add_request(request)
+            return
         if (
             getattr(
                 self,
@@ -456,9 +742,7 @@ class EngineCore:
                     key,
                     set(),
                 ).add(request.request_id)
-                self._direct_prefill_context_by_request[
-                    request.request_id
-                ] = key
+                self._direct_prefill_context_by_request[request.request_id] = key
             self._poll_mm_feature_prefetch_acks()
             return
         if coordinator.handles_streaming(request):
@@ -476,8 +760,19 @@ class EngineCore:
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
-        physical_request_ids = self.streaming_prefill_coordinator.abort(
-            request_ids
+        native_ids = set(
+            getattr(self, "_native_streaming_context_by_anchor", {})
+        ).intersection(request_ids)
+        physical_request_ids = (
+            []
+            if getattr(self, "_optimized_coalesce_enabled", False)
+            else self.streaming_prefill_coordinator.abort(
+                [
+                    request_id
+                    for request_id in request_ids
+                    if request_id not in native_ids
+                ]
+            )
         )
         scheduler_request_ids = [
             request_id
@@ -491,9 +786,14 @@ class EngineCore:
                 RequestStatus.FINISHED_ABORTED,
             )
             self._forget_direct_prefill_requests(scheduler_request_ids)
-            self._finish_or_defer_aborted_mm_feature_dispatches(
-                scheduler_request_ids
-            )
+            self._forget_native_streaming_anchors(scheduler_request_ids)
+            prefetch = getattr(self, "_lane_feature_prefetch", None)
+            if prefetch is not None:
+                prefetch.finish_requests(scheduler_request_ids)
+            if not getattr(self, "_optimized_coalesce_enabled", False):
+                self._finish_or_defer_aborted_mm_feature_dispatches(
+                    scheduler_request_ids
+                )
 
     def _forget_direct_prefill_requests(
         self,
@@ -548,9 +848,7 @@ class EngineCore:
 
         batch_queue = self.batch_queue
         if batch_queue is None:
-            self.streaming_prefill_coordinator.finish_aborted_dispatches(
-                request_ids
-            )
+            self.streaming_prefill_coordinator.finish_aborted_dispatches(request_ids)
             return
 
         queued_ids = {
@@ -560,14 +858,10 @@ class EngineCore:
         }
         deferred = set(request_ids) & queued_ids
         immediate = [
-            request_id
-            for request_id in request_ids
-            if request_id not in deferred
+            request_id for request_id in request_ids if request_id not in deferred
         ]
         if immediate:
-            self.streaming_prefill_coordinator.finish_aborted_dispatches(
-                immediate
-            )
+            self.streaming_prefill_coordinator.finish_aborted_dispatches(immediate)
         self._deferred_mm_feature_abort_dispatches.update(deferred)
 
     def _finish_drained_mm_feature_abort_dispatches(
@@ -577,9 +871,7 @@ class EngineCore:
         deferred = self._deferred_mm_feature_abort_dispatches
         if not deferred:
             return
-        completed_batch_ids = (
-            set(scheduler_output.num_scheduled_tokens) & deferred
-        )
+        completed_batch_ids = set(scheduler_output.num_scheduled_tokens) & deferred
         if not completed_batch_ids:
             return
         batch_queue = self.batch_queue
@@ -674,26 +966,89 @@ class EngineCore:
             return {}, False
         with record_function_or_nullcontext("engine_core: schedule"):
             scheduler_output = self.scheduler.schedule()
+        prefetch = getattr(self, "_lane_feature_prefetch", None)
+        if prefetch is not None:
+            prefetch.prepare_dispatch(scheduler_output, self.scheduler.requests)
         with record_function_or_nullcontext("engine_core: dispatch_workers"):
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
             with record_function_or_nullcontext("engine_core: wait_execute_model"):
-                model_output = future.result()
+                model_output = self._wait_for_model_future(future)
             if model_output is None:
                 with record_function_or_nullcontext("engine_core: sample_tokens"):
-                    model_output = self.model_executor.sample_tokens(grammar_output)
+                    if getattr(self, "_async_streaming_ingest_enabled", False):
+                        sample_future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                        model_output = self._wait_for_model_future(sample_future)
+                    else:
+                        model_output = self.model_executor.sample_tokens(grammar_output)
 
         with record_function_or_nullcontext("engine_core: update_from_output"):
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
+        self._log_native_streaming_prompt_progress(scheduler_output)
+        if prefetch is not None:
+            prefetch.finish_step(scheduler_output, engine_core_outputs)
         self._poll_mm_feature_prefetch_acks()
-        self._update_streaming_prefill_after_step(
-            scheduler_output, engine_core_outputs
-        )
+        self._update_streaming_prefill_after_step(scheduler_output, engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _wait_for_model_future(self, future: Future[_R]) -> _R:
+        if not getattr(self, "_async_streaming_ingest_enabled", False):
+            return future.result()
+        # The executor owns response I/O. Only this Core thread applies input,
+        # aggregates the response, and subsequently commits Scheduler state.
+        return future.result_with_callback(  # type: ignore[attr-defined]
+            self._pump_inflight_streaming_appends,  # type: ignore[attr-defined]
+        )
+
+    def _log_native_streaming_prompt_progress(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Observe completed prefixes, never the pre-incremented in-flight state.
+
+        This is instrumentation only: it creates no application ACK and changes
+        neither admission nor retirement. Single-flight execution lets the
+        post-update count include any KV-load rollback without a later step's
+        optimistic progress. The old prompt snapshot also bounds every record.
+        """
+
+        if (
+            not getattr(self, "_optimized_coalesce_enabled", False)
+            or not getattr(self, "_coordinator_cpu_metrics_enabled", False)
+            or not logger.isEnabledFor(INFO)
+        ):
+            return
+        completed_wall_ns = time.time_ns()
+        for request_id, (
+            revision,
+            prompt_tokens,
+        ) in scheduler_output.streaming_anchor_snapshots.items():
+            request = self.scheduler.requests.get(request_id)  # type: ignore[attr-defined]
+            if request is None:
+                continue
+            metadata = request.prefill_context
+            payload = {
+                "request_id": request_id,
+                "router_session_id": (
+                    metadata.router_session_id if metadata is not None else None
+                ),
+                "context_lifetime_id": (
+                    metadata.context_lifetime_id if metadata is not None else None
+                ),
+                "prompt_revision": revision,
+                "snapshot_prompt_tokens": prompt_tokens,
+                "confirmed_tokens": min(prompt_tokens, request.num_computed_tokens),
+                "completed_wall_ns": completed_wall_ns,
+            }
+            logger.info(
+                "native_streaming_prompt_progress %s",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
 
     def _maybe_log_mm_feature_prefetch_metrics(self) -> None:
         """Periodically write aggregate side-channel tuning counters."""
@@ -738,6 +1093,9 @@ class EngineCore:
         scheduler_output: SchedulerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> None:
+        self._finish_native_streaming_outputs(engine_core_outputs)
+        if getattr(self, "_optimized_coalesce_enabled", False):
+            return
         if getattr(
             self,
             "_direct_streaming_prefill_baseline_enabled",
@@ -869,9 +1227,7 @@ class EngineCore:
                 scheduler_output, model_output
             )
         self._poll_mm_feature_prefetch_acks()
-        self._update_streaming_prefill_after_step(
-            scheduler_output, engine_core_outputs
-        )
+        self._update_streaming_prefill_after_step(scheduler_output, engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -888,9 +1244,7 @@ class EngineCore:
                 )
             batch_queue.appendleft((future, deferred_scheduler_output))
 
-        self._finish_drained_mm_feature_abort_dispatches(
-            scheduler_output
-        )
+        self._finish_drained_mm_feature_abort_dispatches(scheduler_output)
         return engine_core_outputs, model_executed
 
     def shutdown(self):
@@ -920,6 +1274,9 @@ class EngineCore:
 
         self.model_executor.reset_mm_cache()
         self.streaming_prefill_coordinator.reset_mm_prefetch_state()
+        prefetch = getattr(self, "_lane_feature_prefetch", None)
+        if prefetch is not None:
+            prefetch.reset_after_worker_cache_clear()
 
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
@@ -930,6 +1287,17 @@ class EngineCore:
         context_lifetime_id: int,
     ) -> None:
         """Retire one application media-context lifetime idempotently."""
+
+        if getattr(self, "_optimized_coalesce_enabled", False):
+            self._ensure_native_streaming_registry()
+            key = (router_session_id, context_lifetime_id)
+            self._retired_native_streaming_contexts.add(key)
+            request_ids = list(self._native_streaming_anchors_by_context.get(key, ()))
+            self.abort_requests(request_ids)
+            prefetch = getattr(self, "_lane_feature_prefetch", None)
+            if prefetch is not None:
+                prefetch.retire_context(key)
+            return
 
         if getattr(
             self,
@@ -957,20 +1325,16 @@ class EngineCore:
                 )
             return
 
-        physical_request_ids = (
-            self.streaming_prefill_coordinator.retire_context(
-                router_session_id,
-                context_lifetime_id,
-            )
+        physical_request_ids = self.streaming_prefill_coordinator.retire_context(
+            router_session_id,
+            context_lifetime_id,
         )
         if physical_request_ids:
             self.scheduler.finish_requests(
                 physical_request_ids,
                 RequestStatus.FINISHED_ABORTED,
             )
-            self._finish_or_defer_aborted_mm_feature_dispatches(
-                physical_request_ids
-            )
+            self._finish_or_defer_aborted_mm_feature_dispatches(physical_request_ids)
 
     def sleep(self, level: int = 1):
         self.model_executor.sleep(level)
@@ -1057,7 +1421,10 @@ class EngineCore:
         # before this request waits for the EngineCore main loop. This method
         # only mutates the tracker's locked transport state; context/coalescing
         # and Scheduler state stay main-thread owned.
-        if not getattr(
+        prefetch = getattr(self, "_lane_feature_prefetch", None)
+        if prefetch is not None:
+            prefetch.offer_early(req)
+        elif not getattr(
             self,
             "_direct_streaming_prefill_baseline_enabled",
             False,
@@ -1380,6 +1747,11 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
+        deferred = getattr(self, "_deferred_inflight_input", None)
+        if deferred is not None:
+            self._deferred_inflight_input = None
+            self._handle_client_request(*deferred)
+
         if self._enginecore_input_observability_enabled:
             self._process_input_queue_observed()
             return
@@ -1405,6 +1777,79 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+
+    def _is_safe_inflight_streaming_append(
+        self, request_type: EngineCoreRequestType, payload: Any
+    ) -> bool:
+        """Allow only a non-final suffix on an already admitted native anchor."""
+
+        if request_type != EngineCoreRequestType.ADD:
+            return False
+        request, _request_wave = payload
+        metadata = request.prefill_context
+        if (
+            not request.is_streaming_prompt
+            or request.is_prompt_update
+            or request.is_streaming_prompt_finished
+            or not request.prompt_token_ids
+            or request.prompt_embeds is not None
+            or metadata is None
+            or metadata.kind != "streaming"
+        ):
+            return False
+        existing = self.scheduler.requests.get(request.request_id)  # type: ignore[attr-defined]
+        return bool(
+            existing is not None
+            and existing.streaming_anchor_open
+            and self._native_streaming_context_by_anchor.get(request.request_id)
+            == (metadata.router_session_id, metadata.context_lifetime_id)
+        )
+
+    def _pump_inflight_streaming_appends(self) -> None:
+        """Bounded Core-owned input work while the executor awaits a response.
+
+        Keep the first non-APPEND out of the queue, in its original FIFO position.
+        The normal drain handles it only after the current result has committed.
+        Thus retirement/abort cannot free KV or MM payloads used by the Worker.
+        """
+
+        if getattr(self, "_deferred_inflight_input", None) is not None:
+            return
+        started_wall_ns = time.monotonic_ns()
+        metrics_enabled = getattr(self, "_coordinator_cpu_metrics_enabled", False)
+        started_cpu_ns = thread_cpu_time_ns() if metrics_enabled else 0
+        message_count = 0
+        fenced = False
+        for _ in range(_ASYNC_STREAMING_INGEST_MAX_MESSAGES):
+            if (
+                time.monotonic_ns() - started_wall_ns
+                >= _ASYNC_STREAMING_INGEST_MAX_TIME_NS
+            ):
+                break
+            try:
+                item = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not self._is_safe_inflight_streaming_append(*item):
+                self._deferred_inflight_input = item
+                fenced = True
+                break
+            self._handle_client_request(*item)
+            message_count += 1
+        if metrics_enabled and (message_count or fenced):
+            metrics = self.coordinator_cpu_metrics
+            metrics.record_counter("async_streaming_ingest_append_count", message_count)
+            metrics.record_counter(
+                "async_streaming_ingest_fifo_fence_count", int(fenced)
+            )
+            metrics.record_cpu_ns(
+                "async_streaming_ingest",
+                thread_cpu_time_ns() - started_cpu_ns,
+                count=message_count,
+            )
+            metrics.record_counter(
+                "async_streaming_ingest_wall_ns", time.monotonic_ns() - started_wall_ns
+            )
 
     def _process_input_queue_observed(self) -> None:
         """Drain client work with optional per-round fairness budgets.
@@ -1463,10 +1908,7 @@ class EngineCoreProc(EngineCore):
             if max_time_ns is not None:
                 if processing_started_wall_ns is None:
                     processing_started_wall_ns = time.monotonic_ns()
-                if (
-                    time.monotonic_ns() - processing_started_wall_ns
-                    >= max_time_ns
-                ):
+                if time.monotonic_ns() - processing_started_wall_ns >= max_time_ns:
                     time_budget_hit = True
                     break
             try:
@@ -1551,9 +1993,7 @@ class EngineCoreProc(EngineCore):
                 **trace_fields,
             )
             self.add_request(req, request_wave)
-            pending = (
-                self.streaming_prefill_coordinator.take_pending_outputs()
-            )
+            pending = self.streaming_prefill_coordinator.take_pending_outputs()
             for output in pending.items():
                 self.output_queue.put_nowait(output)
             record_kv_transfer_trace(
@@ -1564,9 +2004,7 @@ class EngineCoreProc(EngineCore):
             )
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
-            pending = (
-                self.streaming_prefill_coordinator.take_pending_outputs()
-            )
+            pending = self.streaming_prefill_coordinator.take_pending_outputs()
             for pending_output in pending.items():
                 self.output_queue.put_nowait(pending_output)
         elif request_type == EngineCoreRequestType.INTERRUPT_PREEMPT_TO_LMCACHE:
@@ -1598,9 +2036,7 @@ class EngineCoreProc(EngineCore):
             self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=output))
             )
-            pending = (
-                self.streaming_prefill_coordinator.take_pending_outputs()
-            )
+            pending = self.streaming_prefill_coordinator.take_pending_outputs()
             for pending_output in pending.items():
                 self.output_queue.put_nowait(pending_output)
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:

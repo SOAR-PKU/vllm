@@ -123,7 +123,13 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def get_num_unfinished_requests(self) -> int:
-        """Number of unfinished requests in the scheduler's internal queue."""
+        """Number of live requests in the scheduler's internal queues.
+
+        A live request need not have executable work in the next iteration. For
+        example, an open mutable streaming request can wait at its current
+        prompt frontier while retaining KV state. Call :meth:`has_requests` to
+        decide whether the engine should run another scheduler iteration.
+        """
         raise NotImplementedError
 
     def has_unfinished_requests(self) -> bool:
@@ -147,8 +153,13 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     def has_requests(self) -> bool:
-        """Returns True if there are unfinished requests, or finished requests
-        not yet returned in SchedulerOutputs."""
+        """Return whether the engine should run another scheduler iteration.
+
+        The default remains equivalent to the historical unfinished-or-finished
+        test. Schedulers with live but temporarily non-runnable requests may
+        override this method while keeping :meth:`has_unfinished_requests` true
+        until those requests are explicitly finished.
+        """
         return self.has_unfinished_requests() or self.has_finished_requests()
 
     @abstractmethod

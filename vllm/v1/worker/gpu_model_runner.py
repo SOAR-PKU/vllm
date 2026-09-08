@@ -161,7 +161,11 @@ from .utils import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.core.sched.output import (
+        GrammarOutput,
+        MutableRequestData,
+        SchedulerOutput,
+    )
 
 logger = init_logger(__name__)
 
@@ -699,6 +703,58 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _apply_cached_prompt_update(
+        self,
+        req_state: CachedRequestState,
+        update: "MutableRequestData",
+    ) -> bool:
+        """Replace one worker-cached prompt with a newer full snapshot."""
+
+        if update.revision <= req_state.prompt_revision:
+            return False
+
+        old_prompt_token_ids = req_state.prompt_token_ids
+        if old_prompt_token_ids is None or req_state.prompt_embeds is not None:
+            raise RuntimeError(
+                "Mutable cached requests require token IDs without prompt embeds"
+            )
+        if (
+            len(update.prompt_token_ids) < len(old_prompt_token_ids)
+            or update.prompt_token_ids[: len(old_prompt_token_ids)]
+            != old_prompt_token_ids
+        ):
+            raise RuntimeError("Worker received a non-append-only prompt update")
+
+        def mm_identity(features):
+            return tuple(
+                (
+                    feature.modality,
+                    feature.identifier,
+                    feature.mm_position.offset,
+                    feature.mm_position.length,
+                )
+                for feature in features
+            )
+
+        old_num_mm_features = len(req_state.mm_features)
+        if len(update.mm_features) < old_num_mm_features or mm_identity(
+            update.mm_features[:old_num_mm_features]
+        ) != mm_identity(req_state.mm_features):
+            raise RuntimeError("Worker received a non-append-only MM update")
+
+        req_state.prompt_token_ids = update.prompt_token_ids
+        req_state.mm_features = update.mm_features
+        req_state.num_prompt_tokens = len(update.prompt_token_ids)
+        # The last open-anchor step may have cached a sampler token locally.
+        # Scheduler never accepted it, so it cannot survive a prompt revision.
+        req_state.output_token_ids.clear()
+        req_state.prompt_revision = update.revision
+
+        if self.uses_mrope:
+            self._init_mrope_positions(req_state)
+
+        return True
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -769,6 +825,7 @@ class GPUModelRunner(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
+                prompt_revision=new_req_data.prompt_revision,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
@@ -801,6 +858,17 @@ class GPUModelRunner(
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
+            prompt_update = req_data.prompt_updates.get(req_id)
+            prompt_updated = (
+                prompt_update is not None
+                and self._apply_cached_prompt_update(req_state, prompt_update)
+            )
+            if prompt_updated and req_index is not None:
+                # Re-adding through InputBatch's native path refreshes prompt
+                # token rows, sampling metadata, MM-visible length and blocks as
+                # one consistent batch entry.
+                self.input_batch.remove_request(req_id)
+                req_index = None
 
             # prev_num_draft_len is used in async scheduling mode with
             # spec decode. it indicates if need to update num_computed_tokens
@@ -1923,6 +1991,16 @@ class GPUModelRunner(
             - mm_hashes_pos: List of (mm_hash, position_info) tuples
         """
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        scheduled_features = getattr(scheduler_output, "scheduled_mm_features", None)
+        if scheduled_features is not None and {
+            req_id: set(features) for req_id, features in scheduled_features.items()
+        } != {
+            req_id: set(indices)
+            for req_id, indices in scheduled_encoder_inputs.items()
+        }:
+            raise RuntimeError(
+                "On-demand MM payloads do not match scheduled encoder inputs"
+            )
         if not scheduled_encoder_inputs:
             return [], []
         # Batch the multi-modal inputs.
@@ -1934,6 +2012,20 @@ class GPUModelRunner(
 
             for mm_input_id in encoder_input_ids:
                 mm_feature = req_state.mm_features[mm_input_id]
+                if scheduled_features is not None:
+                    feature = scheduled_features[req_id][mm_input_id]
+                    if (
+                        mm_feature.identifier != feature.identifier
+                        or mm_feature.modality != feature.modality
+                        or mm_feature.mm_position.offset != feature.mm_position.offset
+                        or mm_feature.mm_position.length != feature.mm_position.length
+                    ):
+                        raise RuntimeError(
+                            "On-demand MM payload changed the prompt descriptor"
+                        )
+                    if feature.data is None:
+                        raise RuntimeError("On-demand MM payload was not materialized")
+                    mm_feature = feature
                 mm_hash = mm_feature.identifier
                 mm_kwargs.append(mm_feature.data)
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
@@ -2047,9 +2139,9 @@ class GPUModelRunner(
     ) -> None:
         """Batch all scheduled MM items by modality and restore item order."""
         model = cast(SupportsMultiModal, self.model)
-        indexed_items_by_modality: dict[
-            str, list[tuple[int, MultiModalKwargsItem]]
-        ] = defaultdict(list)
+        indexed_items_by_modality: dict[str, list[tuple[int, MultiModalKwargsItem]]] = (
+            defaultdict(list)
+        )
         for item_index, item in enumerate(mm_kwargs):
             indexed_items_by_modality[item.modality].append((item_index, item))
 
@@ -2105,8 +2197,7 @@ class GPUModelRunner(
 
         assert len(encoder_outputs_by_index) == len(mm_kwargs)
         encoder_outputs = [
-            encoder_outputs_by_index[item_index]
-            for item_index in range(len(mm_kwargs))
+            encoder_outputs_by_index[item_index] for item_index in range(len(mm_kwargs))
         ]
 
         # Cache outputs in the original item order so mm_hashes_pos remains
@@ -2965,9 +3056,7 @@ class GPUModelRunner(
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                with record_function_or_nullcontext(
-                    "gpu_model_runner: compute_logits"
-                ):
+                with record_function_or_nullcontext("gpu_model_runner: compute_logits"):
                     logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.

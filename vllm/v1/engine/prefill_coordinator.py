@@ -662,6 +662,24 @@ class MMFeaturePrefetchTracker:
             )
         self.offer(offered_features)
 
+    def hold_provisional_features(
+        self, owner: str, features: list[MultiModalFeatureSpec]
+    ) -> None:
+        """Own an immutable lane update or query without committing a context."""
+
+        with self._lock:
+            owned = self._provisional.setdefault(owner, set())
+            for feature in features:
+                identifier = feature.identifier
+                if identifier and identifier not in owned:
+                    owned.add(identifier)
+                    self._add_owner(identifier)
+        self.offer(features)
+
+    def horizon_target(self, key: ContextKey) -> int | None:
+        with self._lock:
+            return self._context_horizon_targets.get(key)
+
     def confirm_request(
         self,
         request_id: str,

@@ -2356,6 +2356,76 @@ def test_priority_scheduling_with_limited_slots():
     assert waiting_req_ids == ["2", "0"]
 
 
+def test_priority_query_preempts_parked_anchor_at_sequence_limit():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+    )
+    anchor, query = create_requests_with_priority(
+        num_requests=2,
+        priorities=[1, 0],
+        arrival_times=[1.0, 2.0],
+        num_tokens=16,
+        max_tokens=1,
+    )
+    anchor.start_streaming_anchor()
+    scheduler.add_request(anchor)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {anchor.request_id: 16}
+    assert anchor.streaming_anchor_parked
+    assert scheduler.has_unfinished_requests()
+    assert not scheduler.has_requests()
+
+    scheduler.add_request(query)
+    second = scheduler.schedule()
+
+    assert [request.req_id for request in second.scheduled_new_reqs] == [
+        query.request_id
+    ]
+    assert second.num_scheduled_tokens == {query.request_id: 16}
+    assert query.status == RequestStatus.RUNNING
+    assert anchor.status == RequestStatus.PREEMPTED
+    assert anchor in scheduler.waiting
+
+
+@pytest.mark.parametrize("priority_policy", [False, True])
+def test_idle_lane_slot_reclamation_admits_same_priority_without_ping_pong(
+    priority_policy,
+):
+    factory = create_scheduler_with_priority if priority_policy else create_scheduler
+    scheduler = factory(
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+    )
+    older, newer = create_requests_with_priority(
+        num_requests=2,
+        priorities=[1, 1],
+        arrival_times=[1.0, 2.0],
+        num_tokens=16,
+        max_tokens=1,
+    )
+    older.start_streaming_anchor()
+    newer.start_streaming_anchor()
+    scheduler.add_request(older)
+    assert scheduler.schedule().num_scheduled_tokens == {older.request_id: 16}
+    assert not scheduler.has_requests()
+
+    scheduler.add_request(newer)
+    assert scheduler.schedule().num_scheduled_tokens == {newer.request_id: 16}
+    assert older.status == RequestStatus.PREEMPTED
+    assert older.streaming_anchor_parked
+    assert newer.streaming_anchor_parked
+    assert not scheduler.has_requests()
+    assert scheduler.schedule().num_scheduled_tokens == {}
+
+    older.append_streaming_prompt_chunk(prompt_token_ids=[42])
+    assert scheduler.has_requests()
+    assert set(scheduler.schedule().num_scheduled_tokens) == {older.request_id}
+    assert newer.streaming_anchor_parked
+    assert not scheduler.has_requests()
+
+
 def test_priority_scheduling_heap_property():
     """Test that the waiting queue maintains heap
     property for priority scheduling."""
