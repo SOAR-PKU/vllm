@@ -2356,7 +2356,7 @@ def test_priority_scheduling_with_limited_slots():
     assert waiting_req_ids == ["2", "0"]
 
 
-def test_priority_query_preempts_parked_anchor_at_sequence_limit():
+def test_priority_query_admits_after_idle_anchor_releases_slot():
     scheduler = create_scheduler_with_priority(
         max_num_seqs=1,
         max_num_batched_tokens=128,
@@ -2376,6 +2376,17 @@ def test_priority_query_preempts_parked_anchor_at_sequence_limit():
     assert anchor.streaming_anchor_parked
     assert scheduler.has_unfinished_requests()
     assert not scheduler.has_requests()
+    anchor_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(anchor.request_id).blocks[0]
+    )
+    assert anchor_blocks and all(block.ref_cnt == 1 for block in anchor_blocks)
+
+    scheduler.update_from_output(first, make_output(scheduler))
+
+    assert all(block.ref_cnt == 0 for block in anchor_blocks)
+    assert not scheduler.kv_cache_manager.get_blocks(anchor.request_id).blocks[0]
+    assert anchor not in scheduler.running
+    assert anchor.request_id not in scheduler.finished_req_ids
 
     scheduler.add_request(query)
     second = scheduler.schedule()
@@ -2408,21 +2419,41 @@ def test_idle_lane_slot_reclamation_admits_same_priority_without_ping_pong(
     older.start_streaming_anchor()
     newer.start_streaming_anchor()
     scheduler.add_request(older)
-    assert scheduler.schedule().num_scheduled_tokens == {older.request_id: 16}
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {older.request_id: 16}
     assert not scheduler.has_requests()
+    older_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(older.request_id).blocks[0]
+    )
+    assert older_blocks and all(block.ref_cnt == 1 for block in older_blocks)
+    scheduler.update_from_output(first, make_output(scheduler))
+    assert all(block.ref_cnt == 0 for block in older_blocks)
+    assert older not in scheduler.running
 
     scheduler.add_request(newer)
-    assert scheduler.schedule().num_scheduled_tokens == {newer.request_id: 16}
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens == {newer.request_id: 16}
     assert older.status == RequestStatus.PREEMPTED
     assert older.streaming_anchor_parked
     assert newer.streaming_anchor_parked
+    newer_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(newer.request_id).blocks[0]
+    )
+    assert newer_blocks and all(block.ref_cnt == 1 for block in newer_blocks)
+    scheduler.update_from_output(second, make_output(scheduler))
+    assert all(block.ref_cnt == 0 for block in newer_blocks)
+    assert not scheduler.running
     assert not scheduler.has_requests()
     assert scheduler.schedule().num_scheduled_tokens == {}
 
     older.append_streaming_prompt_chunk(prompt_token_ids=[42])
     assert scheduler.has_requests()
-    assert set(scheduler.schedule().num_scheduled_tokens) == {older.request_id}
+    third = scheduler.schedule()
+    assert set(third.num_scheduled_tokens) == {older.request_id}
     assert newer.streaming_anchor_parked
+    scheduler.update_from_output(third, make_output(scheduler))
+    assert not scheduler.kv_cache_manager.get_blocks(older.request_id).blocks[0]
+    assert not scheduler.running
     assert not scheduler.has_requests()
 
 

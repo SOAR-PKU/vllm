@@ -160,6 +160,14 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def supports_streaming_request_kv_release(self) -> bool:
+        if self._kv_transfer_config.get_from_extra_config("use_native", False):
+            return False
+        method = getattr(
+            self._lmcache_engine, "supports_streaming_request_kv_release", None
+        )
+        return callable(method) and bool(method())
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

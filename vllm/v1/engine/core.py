@@ -1042,7 +1042,10 @@ class EngineCore:
                 ),
                 "prompt_revision": revision,
                 "snapshot_prompt_tokens": prompt_tokens,
-                "confirmed_tokens": min(prompt_tokens, request.num_computed_tokens),
+                "confirmed_tokens": min(
+                    prompt_tokens, request.streaming_anchor_confirmed_tokens
+                ),
+                "kv_allocation_releases": request.num_streaming_kv_releases,
                 "completed_wall_ns": completed_wall_ns,
             }
             logger.info(

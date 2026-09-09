@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -118,6 +118,13 @@ class Scheduler(SchedulerInterface):
             )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
+
+        supports_lane_release = getattr(
+            self.connector, "supports_streaming_request_kv_release", None
+        )
+        self._streaming_lane_kv_release_enabled = self.connector is None or (
+            callable(supports_lane_release) and supports_lane_release() is True
+        )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -305,9 +312,45 @@ class Scheduler(SchedulerInterface):
 
     def _is_recovery_protected(self, request: Request) -> bool:
         return (
-            request.recovery_protected_until_step > self._interrupt_scheduler_step
+            request.streaming_anchor_inflight_steps > 0
+            or request.recovery_protected_until_step > self._interrupt_scheduler_step
             or request.recovery_protected_until_ts > time.monotonic()
         )
+
+    def _can_release_streaming_lane(self, request: Request) -> bool:
+        return (
+            getattr(self, "_streaming_lane_kv_release_enabled", False)
+            and request.is_streaming_anchor
+            and request.streaming_anchor_open
+            and request.status == RequestStatus.RUNNING
+            and request.streaming_anchor_inflight_steps == 0
+            and not request.offloaded_restore_pending
+            and not self._is_recovery_protected(request)
+        )
+
+    def _release_streaming_lane(self, request: Request) -> None:
+        """Yield an allocation, not the logical lane or its completion state."""
+
+        assert self._can_release_streaming_lane(request)
+        self.running.remove(request)
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.num_cached_tokens = -1
+        request.num_streaming_kv_releases += 1
+        # Keep parked lanes dormant. Only APPEND creates new logical work;
+        # losing a cached prefix does not create another prefill obligation.
+        self.waiting.add_request(request)
+
+    def _release_unselected_streaming_lanes(
+        self, selected_req_ids: Collection[str]
+    ) -> None:
+        for request in list(self.running):
+            if request.request_id not in selected_req_ids and (
+                self._can_release_streaming_lane(request)
+            ):
+                self._release_streaming_lane(request)
 
     def _mark_recovery_protected(self, request: Request) -> None:
         request.recovery_protected_until_step = (
@@ -442,11 +485,15 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp: float,
     ) -> None:
         """Release a running request and return it to the ordinary wait queue."""
+        assert request.streaming_anchor_inflight_steps == 0
+        parked = request.is_streaming_anchor and request.streaming_anchor_parked
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        request.streaming_anchor_parked = False
+        request.streaming_anchor_parked = parked
+        if request.is_streaming_anchor:
+            request.num_cached_tokens = -1
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(
@@ -488,6 +535,15 @@ class Scheduler(SchedulerInterface):
         self._process_interrupt_preempt_requests()
         self._maybe_start_recovery_preemption_for_interrupt_head()
 
+        # Dormant lanes must not hide runnable waiting work from priority
+        # comparison. Restore them after this iteration's admission decisions.
+        dormant_waiting_requests = create_request_queue(self.policy)
+        while self.waiting:
+            request = self.waiting.peek_request()
+            if not (request.is_streaming_anchor and request.streaming_anchor_parked):
+                break
+            dormant_waiting_requests.add_request(self.waiting.pop_request())
+
         # First, schedule the RUNNING requests.
         if self.policy == SchedulingPolicy.PRIORITY:
             self.running.sort(key=lambda req: (req.priority, req.arrival_time))
@@ -518,6 +574,7 @@ class Scheduler(SchedulerInterface):
                     < (request.priority, request.arrival_time)
                     and (
                         len(self.running) < self.max_num_running_reqs
+                        or self._can_release_streaming_lane(request)
                         or self._get_parked_priority_admission_victim(
                             waiting_request, scheduled_running_reqs
                         )
@@ -594,37 +651,29 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    # Selected requests may already be this batch's KV or MM
+                    # cache producers. Do not revoke their reservations; an
+                    # in-flight tail must not force eviction of an earlier
+                    # selected producer, even under FCFS.
+                    candidates = [
+                        candidate
+                        for candidate in self.running
+                        if candidate.streaming_anchor_inflight_steps == 0
+                        and candidate not in scheduled_running_reqs
+                    ]
+                    if not candidates:
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            candidates,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens[
-                                preempted_req.request_id
-                            ]
-                            req_to_new_blocks.pop(preempted_req.request_id)
-                            num_scheduled_tokens.pop(preempted_req.request_id)
-                            scheduled_spec_decode_tokens.pop(
-                                preempted_req.request_id, None
-                            )
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req.request_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_tokens_to_restore = sum(
-                                    preempted_req.get_num_encoder_tokens(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_tokens_to_restore
-                            req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
-
+                        preempted_req = candidates[-1]
+                    victim_index = self.running.index(preempted_req)
+                    self.running.remove(preempted_req)
+                    if victim_index < req_index:
+                        req_index -= 1
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -674,6 +723,12 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
+
+        # The running phase selected the resident work for this step. Lanes
+        # it did not select have no claim on slots/KV needed by waiting work.
+        # A voluntary yield must not suppress waiting admission like an OOM
+        # preemption does in the upstream scheduler.
+        self._release_unselected_streaming_lanes(num_scheduled_tokens)
 
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
@@ -1087,6 +1142,8 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+        if dormant_waiting_requests:
+            self.waiting.prepend_requests(dormant_waiting_requests)
         if skipped_interrupt_requests:
             self.interrupt_waiting.prepend_requests(skipped_interrupt_requests)
 
@@ -1197,6 +1254,11 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            if request.is_streaming_anchor:
+                scheduler_output.streaming_anchor_scheduled_endpoints[req_id] = (
+                    request.num_computed_tokens
+                )
+                request.streaming_anchor_inflight_steps += 1
 
             anchor_snapshot = scheduler_output.streaming_anchor_snapshots.get(req_id)
             if anchor_snapshot is not None:
@@ -1257,9 +1319,9 @@ class Scheduler(SchedulerInterface):
                 new_token_ids.append(token_ids)
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
-                assert not scheduled_in_prev_step
+                assert not scheduled_in_prev_step or req.is_streaming_anchor
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            if not scheduled_in_prev_step or req_id in resumed_req_ids:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
@@ -1488,10 +1550,16 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            step_endpoint = scheduler_output.streaming_anchor_scheduled_endpoints.get(
+                req_id
+            )
+            if request is not None and step_endpoint is not None:
+                assert request.streaming_anchor_inflight_steps > 0
+                request.streaming_anchor_inflight_steps -= 1
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
                 continue
-            request = self.requests.get(req_id)
             if request is None:
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -1534,10 +1602,20 @@ class Scheduler(SchedulerInterface):
             if anchor_snapshot is not None:
                 generated_token_ids = []
                 revision, prompt_length = anchor_snapshot
+                if step_endpoint is not None:
+                    request.streaming_anchor_confirmed_tokens = max(
+                        request.streaming_anchor_confirmed_tokens,
+                        min(prompt_length, step_endpoint),
+                    )
                 if (
                     request.streaming_anchor_open
                     and request.prompt_revision == revision
-                    and request.num_computed_tokens >= prompt_length
+                    and (
+                        request.streaming_anchor_confirmed_tokens
+                        if step_endpoint is not None
+                        else request.num_computed_tokens
+                    )
+                    >= prompt_length
                 ):
                     request.streaming_anchor_parked = True
 
@@ -1630,6 +1708,18 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # This is after actual model completion, not optimistic scheduling.
+        # Supported connectors finish their GPU source reads before returning
+        # the result; retained transfers and in-flight steps are never freed.
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if (
+                request is not None
+                and request.streaming_anchor_parked
+                and self._can_release_streaming_lane(request)
+            ):
+                self._release_streaming_lane(request)
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -1758,6 +1848,14 @@ class Scheduler(SchedulerInterface):
         )
 
     def add_request(self, request: Request) -> None:
+        if request.is_streaming_anchor and not getattr(
+            self, "_streaming_lane_kv_release_enabled", False
+        ):
+            raise ValueError(
+                "Streaming lane KV release requires no KV connector or a connector "
+                "with supports_streaming_request_kv_release(). The active "
+                "connector/configuration does not guarantee step-safe release."
+            )
         self.requests[request.request_id] = request
         if INTERRUPT_PRIORITY_REQUEST_ID_MARKER in request.request_id:
             self.enqueue_interrupt_work(request, INTERRUPT_WORK_TRUE_ROLLBACK_APPEND)
@@ -1951,8 +2049,9 @@ class Scheduler(SchedulerInterface):
         """Whether the next EngineCore iteration has scheduler work.
 
         Open anchors that have reached their current prompt frontier remain
-        unfinished and keep their KV allocation, but they have no executable
-        tokens until an append arrives. Ignoring those parked anchors here lets
+        unfinished, but release their KV allocation after the actual step result
+        commits. They have no executable tokens until an append arrives. Ignoring
+        those parked anchors here lets
         EngineCore block on its input queue instead of producing empty steps.
         """
 
