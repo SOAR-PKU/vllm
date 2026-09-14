@@ -282,6 +282,7 @@ async def _test_async_llm_chunk_api_registers_output_processor_only_on_finish() 
             return []
 
     llm = object.__new__(AsyncLLM)
+    llm.model_config = SimpleNamespace(max_model_len=128)
     llm.engine_core = EngineClient()
     llm.processor = Processor()
     llm.output_processor = OutputProcessor()

@@ -129,6 +129,7 @@ def frontend():
             return list(request_ids)
 
     llm = object.__new__(AsyncLLM)
+    llm.model_config = SimpleNamespace(max_model_len=256)
     llm.processor = Processor()
     llm.engine_core = Core()
     llm.output_processor = Output()
