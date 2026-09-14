@@ -1025,9 +1025,18 @@ class AsyncMPClient(MPClient):
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
+    async def submit_utility_async(self, method: str, *args) -> asyncio.Future[Any]:
+        """Finish the ordered IPC send without waiting for Core execution."""
+        return await self._submit_utility_async(method, *args, engine=self.core_engine)
+
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
+        return await (await self._submit_utility_async(method, *args, engine=engine))
+
+    async def _submit_utility_async(
+        self, method: str, *args, engine: EngineIdentity
+    ) -> asyncio.Future[Any]:
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
@@ -1035,9 +1044,15 @@ class AsyncMPClient(MPClient):
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode((self.client_index, call_id, method, args)),
         )
-        await self._send_input_message(message, engine, args)
+        try:
+            await self._send_input_message(message, engine, args)
+        except BaseException:
+            # A cancelled send may already be queued. Retain its tombstone
+            # so a late utility reply can be consumed safely.
+            future.cancel()
+            raise
         self._ensure_output_queue_task()
-        return await future
+        return future
 
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
@@ -1362,6 +1377,19 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 ]
             )
         )[0]
+
+    async def submit_utility_async(self, method: str, *args) -> asyncio.Future[Any]:
+        futures = await asyncio.gather(
+            *[
+                self._submit_utility_async(method, *args, engine=engine)
+                for engine in self.core_engines
+            ]
+        )
+
+        async def first_result():
+            return (await asyncio.gather(*futures))[0]
+
+        return asyncio.create_task(first_result())
 
     @staticmethod
     async def process_engine_outputs(

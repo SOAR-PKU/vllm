@@ -35,6 +35,10 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.func_utils import deprecate_kwargs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.engine import EngineCoreRequest, PrefillContextMetadata
+from vllm.v1.engine.async_processor import (
+    OrderedAsyncProcessor,
+    ordered_processor_call,
+)
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
@@ -130,6 +134,15 @@ class AsyncLLM(EngineClient):
             tokenizer = init_tokenizer_from_configs(self.model_config)
 
         self.processor = Processor(self.vllm_config, tokenizer)
+        self._processor_ingress = (
+            OrderedAsyncProcessor(
+                max_pending=int(
+                    os.environ.get("VLLM_ASYNC_PROCESSOR_MAX_PENDING", "32")
+                )
+            )
+            if os.environ.get("VLLM_ASYNC_PROCESSOR_ENABLED", "1") == "1"
+            else None
+        )
         self.io_processor = get_io_processor(
             self.vllm_config,
             self.model_config.io_processor_plugin,
@@ -276,6 +289,9 @@ class AsyncLLM(EngineClient):
 
         shutdown_prometheus()
 
+        if ingress := getattr(self, "_processor_ingress", None):
+            ingress.shutdown()
+
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown()
 
@@ -286,6 +302,7 @@ class AsyncLLM(EngineClient):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return await self.engine_core.get_supported_tasks_async()
 
+    @ordered_processor_call(stamp_arrival=True)
     async def add_request(
         self,
         request_id: str,
@@ -330,7 +347,7 @@ class AsyncLLM(EngineClient):
                 component="async_llm_frontend",
                 request_id=request_id,
             )
-            request = self.processor.process_inputs(
+            request = await self._process_inputs(
                 request_id,
                 prompt,
                 params,
@@ -373,6 +390,12 @@ class AsyncLLM(EngineClient):
                 child_request, prompt_text, parent_request, idx, queue
             )
         return queue
+
+    async def _process_inputs(self, *args: Any) -> EngineCoreRequest:
+        ingress = getattr(self, "_processor_ingress", None)
+        if ingress is None:
+            return self.processor.process_inputs(*args)
+        return await ingress.process_inputs(self.processor, *args)
 
     async def _add_request(
         self,
@@ -460,6 +483,7 @@ class AsyncLLM(EngineClient):
         if not request_ids:
             self._streaming_prompt_request_ids_by_context.pop(context, None)
 
+    @ordered_processor_call(stamp_arrival=True)
     async def add_streaming_prompt_chunk(
         self,
         prompt: EngineCoreRequest | PromptType,
@@ -542,7 +566,7 @@ class AsyncLLM(EngineClient):
                     f"request_id: {request.request_id!r} != {request_id!r}"
                 )
         else:
-            request = self.processor.process_inputs(
+            request = await self._process_inputs(
                 request_id,
                 prompt,
                 params,
@@ -765,6 +789,7 @@ class AsyncLLM(EngineClient):
         log_stats = self.log_stats
         logger_manager = self.logger_manager
         processor = self.processor
+        processor_ingress = getattr(self, "_processor_ingress", None)
 
         async def output_handler():
             try:
@@ -818,7 +843,11 @@ class AsyncLLM(EngineClient):
                             engine_idx=outputs.engine_index,
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
-                            mm_cache_stats=processor.stat_mm_cache(),
+                            mm_cache_stats=(
+                                processor.stat_mm_cache()
+                                if processor_ingress is None
+                                else processor_ingress.try_stat_mm_cache(processor)
+                            ),
                         )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
@@ -826,6 +855,7 @@ class AsyncLLM(EngineClient):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    @ordered_processor_call(allow_failed=True)
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort RequestId in OutputProcessor and EngineCore."""
 
@@ -859,11 +889,38 @@ class AsyncLLM(EngineClient):
     ) -> None:
         """Permanently retire one streaming media-context lifetime."""
 
-        await self.engine_core.call_utility_async(  # type: ignore[attr-defined]
-            "retire_streaming_prefill_context",
-            router_session_id,
-            context_lifetime_id,
+        completion = await self._submit_streaming_prefill_retirement(
+            router_session_id, context_lifetime_id
         )
+        if completion is not None:
+            await completion
+
+    @ordered_processor_call(allow_failed=True)
+    async def _submit_streaming_prefill_retirement(
+        self,
+        router_session_id: int,
+        context_lifetime_id: int,
+    ) -> asyncio.Future[Any] | None:
+        submit_utility = getattr(self.engine_core, "submit_utility_async", None)
+        if submit_utility is None:
+            # Compatibility with lightweight/legacy Core clients.
+            await self.engine_core.call_utility_async(  # type: ignore[attr-defined]
+                "retire_streaming_prefill_context",
+                router_session_id,
+                context_lifetime_id,
+            )
+            completion = None
+        else:
+            completion = await submit_utility(
+                "retire_streaming_prefill_context",
+                router_session_id,
+                context_lifetime_id,
+            )
+            # A cancelled caller may never await the returned receipt, but
+            # the tombstone and retirement send must still complete.
+            completion.add_done_callback(
+                lambda future: None if future.cancelled() else future.exception()
+            )
         self._ensure_streaming_prompt_frontend_state()
         context = (router_session_id, context_lifetime_id)
         self._retired_streaming_prompt_contexts.add(context)
@@ -879,7 +936,9 @@ class AsyncLLM(EngineClient):
                 request_id,
                 mark_finished=True,
             )
+        return completion
 
+    @ordered_processor_call(allow_failed=True)
     async def preempt_to_lmcache(
         self,
         request_id: str,
@@ -895,6 +954,7 @@ class AsyncLLM(EngineClient):
         )
         return {"status": "accepted"}
 
+    @ordered_processor_call(allow_failed=True)
     async def resume_from_lmcache(
         self,
         request_id: str,
@@ -903,6 +963,7 @@ class AsyncLLM(EngineClient):
         await self.engine_core.interrupt_resume_async(request_id, interrupt_seq)
         return {"status": "accepted"}
 
+    @ordered_processor_call(allow_failed=True)
     async def confirm_interrupt(
         self,
         request_id: str,
@@ -1013,6 +1074,9 @@ class AsyncLLM(EngineClient):
 
     @tokenizer.setter
     def tokenizer(self, tokenizer: AnyTokenizer | None) -> None:
+        ingress = getattr(self, "_processor_ingress", None)
+        if ingress is not None and ingress.busy:
+            raise RuntimeError("Cannot replace tokenizer during frontend admission")
         self.processor.tokenizer = tokenizer
 
     async def get_tokenizer(self) -> AnyTokenizer:
@@ -1047,8 +1111,14 @@ class AsyncLLM(EngineClient):
             coros.append(asyncio.to_thread(self.profiler.stop))
         await asyncio.gather(*coros)
 
+    @ordered_processor_call(allow_failed=True, recovery=True)
     async def reset_mm_cache(self) -> None:
-        self.processor.clear_mm_cache()
+        ingress = getattr(self, "_processor_ingress", None)
+        if ingress is None:
+            self.processor.clear_mm_cache()
+        else:
+            ingress.mark_cache_mutation()
+            await ingress.call_cpu(self.processor.clear_mm_cache)
         await self.engine_core.reset_mm_cache_async()
 
     async def reset_prefix_cache(self) -> None:

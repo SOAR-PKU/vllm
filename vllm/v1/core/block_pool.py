@@ -157,6 +157,12 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
 
+        # CPU-only residency certificates never acquire a block reference.
+        # A generation changes when a cached allocation is actually evicted,
+        # not when its last owner releases it into the free queue.
+        self.cache_eviction_epoch = 0
+        self.block_cache_generations = [0] * num_gpu_blocks
+
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
@@ -316,6 +322,8 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        self.cache_eviction_epoch += 1
+        self.block_cache_generations[block.block_id] = self.cache_eviction_epoch
 
         if self.enable_kv_cache_events:
             # FIXME (Chen): Not sure whether we should return `hash_value`
@@ -382,6 +390,10 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cache_eviction_epoch += 1
+        self.block_cache_generations[:] = [
+            self.cache_eviction_epoch
+        ] * self.num_gpu_blocks
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

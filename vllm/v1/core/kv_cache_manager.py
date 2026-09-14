@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -9,12 +10,26 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _StreamingPrefixSnapshot:
+    request: Request
+    blocks: tuple[KVCacheBlock, ...]
+    generations: tuple[int, ...]
+    terminal_hash: BlockHash
+    eviction_epoch: int
+    valid_blocks: int
 
 
 @dataclass
@@ -142,6 +157,19 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self._streaming_resume_cache_enabled = (
+            os.getenv("VLLM_STREAMING_LANE_RESUME_CACHE", "1") == "1"
+            and enable_caching
+            and not use_eagle
+            and dcp_world_size == 1
+            and self.num_kv_cache_groups == 1
+            and type(kv_cache_config.kv_cache_groups[0].kv_cache_spec)
+            is FullAttentionSpec
+        )
+        self._streaming_prefix_snapshots: dict[str, _StreamingPrefixSnapshot] = {}
+        self.streaming_resume_cache_hits = 0
+        self.streaming_resume_cache_validated_blocks = 0
+        self.streaming_resume_cache_invalidations = 0
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -199,11 +227,15 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
+        cached_prefix = self._get_streaming_cached_prefix(request)
+        if cached_prefix is None:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
             )
-        )
+        else:
+            computed_blocks, num_new_computed_tokens = cached_prefix
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -214,6 +246,100 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _get_streaming_cached_prefix(
+        self, request: Request
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        snapshot = self._streaming_prefix_snapshots.get(request.request_id)
+        if snapshot is None:
+            return None
+        num_blocks = len(snapshot.blocks)
+        if (
+            snapshot.request is not request
+            or not request.is_streaming_anchor
+            or len(request.block_hashes) < num_blocks
+            or request.block_hashes[num_blocks - 1] != snapshot.terminal_hash
+        ):
+            self._streaming_prefix_snapshots.pop(request.request_id, None)
+            return None
+
+        pool = self.block_pool
+        valid_blocks = snapshot.valid_blocks
+        if snapshot.eviction_epoch != pool.cache_eviction_epoch:
+            # Usually there were no evictions. Under pressure, validate the
+            # saved physical generations rather than querying every hash.
+            for index in range(valid_blocks):
+                self.streaming_resume_cache_validated_blocks += 1
+                block = snapshot.blocks[index]
+                if (
+                    pool.block_cache_generations[block.block_id]
+                    != snapshot.generations[index]
+                ):
+                    valid_blocks = index
+                    self.streaming_resume_cache_invalidations += 1
+                    break
+            snapshot.valid_blocks = valid_blocks
+            snapshot.eviction_epoch = pool.cache_eviction_epoch
+
+        assert self.block_size is not None
+        max_hit_tokens = request.num_tokens - 1
+        valid_blocks = min(valid_blocks, max_hit_tokens // self.block_size)
+        if not valid_blocks:
+            return None
+
+        self.streaming_resume_cache_hits += 1
+        blocks = list(snapshot.blocks[:valid_blocks])
+        prefix_tokens = valid_blocks * self.block_size
+        # Another lane can have cached the newly appended suffix. Preserve the
+        # native longest-prefix result instead of stopping at the old frontier.
+        if prefix_tokens + self.block_size <= max_hit_tokens:
+            suffix_blocks, suffix_tokens = self.coordinator.find_longest_cache_hit(
+                request.block_hashes[valid_blocks:], max_hit_tokens - prefix_tokens
+            )
+            blocks.extend(suffix_blocks[0])
+            prefix_tokens += suffix_tokens
+        return (blocks,), prefix_tokens
+
+    def _remember_streaming_prefix(self, request: Request) -> None:
+        if (
+            not self._streaming_resume_cache_enabled
+            or not request.is_streaming_anchor
+            or not request.streaming_anchor_open
+            or request.streaming_anchor_inflight_steps
+            or request.skip_reading_prefix_cache
+        ):
+            return
+        assert self.block_size is not None
+        num_blocks = (
+            min(request.num_computed_tokens, request.streaming_anchor_confirmed_tokens)
+            // self.block_size
+        )
+        if not num_blocks:
+            return
+        blocks = self.coordinator.get_blocks(request.request_id)[0][:num_blocks]
+        # Remote/pending or partial allocations may not have committed hashes.
+        # Only retain the contiguous full prefix represented by real cache keys.
+        valid = 0
+        for block, block_hash in zip(blocks, request.block_hashes):
+            if block.is_null or block.block_hash != make_block_hash_with_group_id(
+                block_hash, 0
+            ):
+                break
+            valid += 1
+        if not valid:
+            return
+        blocks_tuple = tuple(blocks[:valid])
+        pool = self.block_pool
+        self._streaming_prefix_snapshots[request.request_id] = _StreamingPrefixSnapshot(
+            request=request,
+            blocks=blocks_tuple,
+            generations=tuple(
+                pool.block_cache_generations[block.block_id] for block in blocks_tuple
+            ),
+            terminal_hash=request.block_hashes[valid - 1],
+            eviction_epoch=pool.cache_eviction_epoch,
+            valid_blocks=valid,
+        )
 
     def allocate_slots(
         self,
@@ -332,7 +458,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
-    def free(self, request: Request) -> None:
+    def free(self, request: Request, *, cache_streaming_prefix: bool = False) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
@@ -340,6 +466,9 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        self._streaming_prefix_snapshots.pop(request.request_id, None)
+        if cache_streaming_prefix:
+            self._remember_streaming_prefix(request)
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:
@@ -353,6 +482,7 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        self._streaming_prefix_snapshots.clear()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

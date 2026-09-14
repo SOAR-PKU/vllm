@@ -271,6 +271,11 @@ class BaseMultiModalProcessorCache(
 ):
     """The required interface for caches on P0."""
 
+    def __init__(self) -> None:
+        # Async frontend admission uses this to distinguish rejected input
+        # from a cache update whose matching IPC message was not committed.
+        self.mutation_revision = 0
+
     @abstractmethod
     def is_cached_item(self, mm_hash: str) -> bool:
         """
@@ -344,6 +349,7 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
         mm_item: MultiModalProcessorCacheInItem,
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
+        self.mutation_revision += 1
         if (cached_item := self._cache.get(mm_hash)) is not None:
             return cached_item.item, cached_item.prompt_updates
 
@@ -355,6 +361,7 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
 
     @override
     def clear_cache(self) -> None:
+        self.mutation_revision += 1
         self._cache.clear()
 
     @override
@@ -398,6 +405,7 @@ class MultiModalProcessorSenderCache(BaseMultiModalProcessorCache):
         mm_item: MultiModalProcessorCacheInItem,
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
+        self.mutation_revision += 1
         if (cached_item := self._cache.get(mm_hash)) is not None:
             return None, cached_item.prompt_updates
 
@@ -409,6 +417,7 @@ class MultiModalProcessorSenderCache(BaseMultiModalProcessorCache):
 
     @override
     def clear_cache(self) -> None:
+        self.mutation_revision += 1
         self._cache.clear()
 
     @override
@@ -472,6 +481,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
         mm_item: MultiModalProcessorCacheInItem,
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
+        self.mutation_revision += 1
         if self._shm_cache.is_cached(mm_hash):
             self._hits += 1
             self._total += 1
@@ -503,6 +513,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
 
     @override
     def clear_cache(self) -> None:
+        self.mutation_revision += 1
         self._shm_cache.clear()
         self._p0_cache.clear()
 

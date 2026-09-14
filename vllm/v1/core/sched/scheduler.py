@@ -333,7 +333,7 @@ class Scheduler(SchedulerInterface):
 
         assert self._can_release_streaming_lane(request)
         self.running.remove(request)
-        self.kv_cache_manager.free(request)
+        self.kv_cache_manager.free(request, cache_streaming_prefix=True)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
