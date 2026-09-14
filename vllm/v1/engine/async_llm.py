@@ -286,6 +286,22 @@ class AsyncLLM(EngineClient):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return await self.engine_core.get_supported_tasks_async()
 
+    def _prepare_tokenization_kwargs(
+        self,
+        params: SamplingParams,
+        tokenization_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Keep streaming and query multimodal cache identities consistent."""
+        if tokenization_kwargs is not None:
+            return dict(tokenization_kwargs)
+        kwargs: dict[str, Any] = {}
+        _validate_truncation_size(
+            self.model_config.max_model_len,
+            params.truncate_prompt_tokens,
+            kwargs,
+        )
+        return kwargs
+
     async def add_request(
         self,
         request_id: str,
@@ -542,6 +558,11 @@ class AsyncLLM(EngineClient):
                     f"request_id: {request.request_id!r} != {request_id!r}"
                 )
         else:
+            # MM hashes include tokenization kwargs, including explicit False.
+            # Match generate() even when both paths leave the tokens unchanged.
+            tokenization_kwargs = self._prepare_tokenization_kwargs(
+                params, tokenization_kwargs
+            )
             request = self.processor.process_inputs(
                 request_id,
                 prompt,
@@ -687,15 +708,9 @@ class AsyncLLM(EngineClient):
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
 
-            if tokenization_kwargs is None:
-                tokenization_kwargs = {}
-                truncate_prompt_tokens = sampling_params.truncate_prompt_tokens
-
-                _validate_truncation_size(
-                    self.model_config.max_model_len,
-                    truncate_prompt_tokens,
-                    tokenization_kwargs,
-                )
+            tokenization_kwargs = self._prepare_tokenization_kwargs(
+                sampling_params, tokenization_kwargs
+            )
 
             q = await self.add_request(
                 request_id,
