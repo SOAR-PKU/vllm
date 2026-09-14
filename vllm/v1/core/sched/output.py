@@ -141,8 +141,8 @@ class CachedRequestData:
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
-    # For requests not scheduled in the last step, propagate the token ids to the
-    # connector. Won't contain requests that were scheduled in the prior step.
+    # Full token snapshots for resumed requests and requests absent last step.
+    # A streaming lane can release and resume in consecutive steps.
     all_token_ids: dict[str, list[int]]
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
@@ -224,6 +224,10 @@ class SchedulerOutput:
     # progress. A later append must not turn this iteration's dummy sample into
     # a real output token.
     streaming_anchor_snapshots: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    # Immutable execution endpoints, separate from a lane's mutable input and
+    # optimistic scheduler frontier. Used only when the model result commits.
+    streaming_anchor_scheduled_endpoints: dict[str, int] = field(default_factory=dict)
 
     # Optional on-demand encoder payloads for metadata-only prompt snapshots.
     # None preserves the legacy full-payload path; an empty dict means that

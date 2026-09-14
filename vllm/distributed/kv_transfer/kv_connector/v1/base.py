@@ -375,6 +375,16 @@ class KVConnectorBase_V1(ABC):
     # Scheduler-side methods
     # ==============================
 
+    def supports_streaming_request_kv_release(self) -> bool:
+        """Whether completed streaming steps may relinquish their KV blocks.
+
+        Opt-in requires that all connector accesses to a scheduled request's
+        GPU blocks finish before its ModelRunnerOutput is returned, and that
+        resuming with a replacement block table preserves connector state.
+        This does not authorize release during an in-flight step or transfer.
+        """
+        return False
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

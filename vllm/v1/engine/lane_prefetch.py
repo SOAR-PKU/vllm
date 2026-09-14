@@ -155,9 +155,13 @@ class NativeLaneFeaturePrefetch:
         )
 
     def _horizon(self, lane: Request) -> int:
+        # Releasing GPU blocks must not rewind the look-ahead window to zero.
+        # Actual encoder dispatch still has per-feature inline fallback if a
+        # missing KV prefix needs recomputation after cache eviction.
+        frontier = max(lane.num_computed_tokens, lane.streaming_anchor_confirmed_tokens)
         target = _prefetch_horizon_target(
             request=lane,
-            computed_frontier=lane.num_computed_tokens,
+            computed_frontier=frontier,
             inflight_target=None,
             horizon_chunks=self.tracker.horizon_chunks,
             chunk_token_cap=self.tracker.chunk_token_cap,
@@ -169,8 +173,7 @@ class NativeLaneFeaturePrefetch:
             # Only complete MM features inside that window are offered early.
             target = max(
                 target,
-                lane.num_computed_tokens
-                + self.tracker.horizon_chunks * self.tracker.chunk_token_cap,
+                frontier + self.tracker.horizon_chunks * self.tracker.chunk_token_cap,
             )
         return target
 

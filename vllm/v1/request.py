@@ -126,6 +126,12 @@ class Request:
         self.is_streaming_anchor = False
         self.streaming_anchor_open = False
         self.streaming_anchor_parked = False
+        # Logical completion survives releasing the physical KV allocation.
+        # In-flight steps, unlike the optimistic num_computed_tokens frontier,
+        # protect blocks until their actual model outputs have been consumed.
+        self.streaming_anchor_confirmed_tokens = 0
+        self.streaming_anchor_inflight_steps = 0
+        self.num_streaming_kv_releases = 0
         self.prompt_revision = 0
         self.worker_prompt_revision = -1
         self.is_streaming_prompt = is_streaming_prompt

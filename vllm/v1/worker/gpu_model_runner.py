@@ -863,10 +863,12 @@ class GPUModelRunner(
                 prompt_update is not None
                 and self._apply_cached_prompt_update(req_state, prompt_update)
             )
-            if prompt_updated and req_index is not None:
+            if (prompt_updated or resumed_from_preemption) and req_index is not None:
                 # Re-adding through InputBatch's native path refreshes prompt
                 # token rows, sampling metadata, MM-visible length and blocks as
-                # one consistent batch entry.
+                # one consistent batch entry. A streaming lane can release KV
+                # after a completed step and resume on the very next step, so a
+                # resumed request may still have an old row in this batch.
                 self.input_batch.remove_request(req_id)
                 req_index = None
 

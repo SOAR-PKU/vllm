@@ -2376,6 +2376,13 @@ def test_priority_query_preempts_parked_anchor_at_sequence_limit():
     assert anchor.streaming_anchor_parked
     assert scheduler.has_unfinished_requests()
     assert not scheduler.has_requests()
+    anchor_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(anchor.request_id).blocks[0]
+    )
+    assert anchor_blocks and all(block.ref_cnt == 1 for block in anchor_blocks)
+    scheduler.update_from_output(first, make_output(scheduler))
+    assert anchor in scheduler.running
+    assert all(block.ref_cnt == 1 for block in anchor_blocks)
 
     scheduler.add_request(query)
     second = scheduler.schedule()
@@ -2408,21 +2415,29 @@ def test_idle_lane_slot_reclamation_admits_same_priority_without_ping_pong(
     older.start_streaming_anchor()
     newer.start_streaming_anchor()
     scheduler.add_request(older)
-    assert scheduler.schedule().num_scheduled_tokens == {older.request_id: 16}
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {older.request_id: 16}
     assert not scheduler.has_requests()
+    scheduler.update_from_output(first, make_output(scheduler))
+    assert older in scheduler.running
 
     scheduler.add_request(newer)
-    assert scheduler.schedule().num_scheduled_tokens == {newer.request_id: 16}
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens == {newer.request_id: 16}
     assert older.status == RequestStatus.PREEMPTED
     assert older.streaming_anchor_parked
     assert newer.streaming_anchor_parked
+    scheduler.update_from_output(second, make_output(scheduler))
+    assert newer in scheduler.running
     assert not scheduler.has_requests()
     assert scheduler.schedule().num_scheduled_tokens == {}
 
     older.append_streaming_prompt_chunk(prompt_token_ids=[42])
     assert scheduler.has_requests()
-    assert set(scheduler.schedule().num_scheduled_tokens) == {older.request_id}
+    third = scheduler.schedule()
+    assert set(third.num_scheduled_tokens) == {older.request_id}
     assert newer.streaming_anchor_parked
+    scheduler.update_from_output(third, make_output(scheduler))
     assert not scheduler.has_requests()
 
 
