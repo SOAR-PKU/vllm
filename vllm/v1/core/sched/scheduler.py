@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -100,6 +101,7 @@ class Scheduler(SchedulerInterface):
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
+        self._benchmark_token_quotas: dict[str, int] | None = None
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -507,6 +509,64 @@ class Scheduler(SchedulerInterface):
             )
         self.waiting.prepend_request(request)
 
+    def set_benchmark_token_quotas(self, quotas: dict[str, int] | None) -> None:
+        """Cap per-step compute tokens for an explicitly opted-in experiment.
+
+        Caps persist until replaced; ``None`` restores native scheduling. Missing
+        IDs and zero caps are excluded, without releasing their resident KV.
+        This is not an admission guarantee: native resource limits still apply.
+        Call only between schedule invocations on the EngineCore thread.
+        """
+        if quotas is None:
+            self._benchmark_token_quotas = None
+            return
+        if os.environ.get("LLM_RTC_ALGO_SURVEY") != "1":
+            raise RuntimeError("Benchmark token quotas require LLM_RTC_ALGO_SURVEY=1")
+        if type(quotas) is not dict:
+            raise TypeError("Benchmark token quotas must be a dict or None")
+        if not self.scheduler_config.enable_chunked_prefill:
+            raise ValueError("Benchmark token quotas require chunked prefill")
+        copied = {}
+        for request_id, quota in quotas.items():
+            if type(request_id) is not str or not request_id:
+                raise ValueError("Benchmark request IDs must be nonempty strings")
+            if type(quota) is not int or quota < 0:
+                raise ValueError("Benchmark token quotas must be nonnegative integers")
+            if request_id not in self.requests:
+                raise ValueError(f"Unknown benchmark request ID: {request_id}")
+            copied[request_id] = quota
+        self._benchmark_token_quotas = copied
+
+    @staticmethod
+    def _peek_benchmark_waiter(
+        queue: RequestQueue, quotas: dict[str, int] | None
+    ) -> Request | None:
+        if not queue:
+            return None
+        if quotas is None:
+            return queue.peek_request()
+        return next(
+            (
+                request
+                for request in queue
+                if quotas.get(request.request_id, 0) > 0
+                and not (
+                    request.is_streaming_anchor and request.streaming_anchor_parked
+                )
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _pop_benchmark_waiter(
+        queue: RequestQueue, request: Request, quotas: dict[str, int] | None
+    ) -> Request:
+        if quotas is None:
+            return queue.pop_request()
+        # Excluded waiters retain their original queue and relative order.
+        queue.remove_request(request)
+        return request
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -519,6 +579,7 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        benchmark_token_quotas = self._benchmark_token_quotas
         trace_enabled = kv_transfer_trace_enabled()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -538,7 +599,14 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
         self._interrupt_scheduler_step += 1
         self._process_interrupt_preempt_requests()
-        self._maybe_start_recovery_preemption_for_interrupt_head()
+        if benchmark_token_quotas is None or (
+            self.interrupt_waiting
+            and benchmark_token_quotas.get(
+                self.interrupt_waiting.peek_request().request_id, 0
+            )
+            > 0
+        ):
+            self._maybe_start_recovery_preemption_for_interrupt_head()
 
         # Dormant lanes must not hide runnable waiting work from priority
         # comparison. Restore them after this iteration's admission decisions.
@@ -556,37 +624,48 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            benchmark_quota = (
+                None
+                if benchmark_token_quotas is None
+                else benchmark_token_quotas.get(request.request_id, 0)
+            )
+            if benchmark_quota == 0:
+                req_index += 1
+                continue
 
             # A newly queued foreground request must get its first scheduling
             # opportunity before lower-priority running work consumes this
             # iteration's token budget. Keep the running request resident; the
             # existing waiting phase below will admit the foreground request.
+            waiting_request = self._peek_benchmark_waiter(
+                self.waiting, benchmark_token_quotas
+            )
             if (
                 self.policy == SchedulingPolicy.PRIORITY
-                and self.waiting
-                and not self.remote_kv_ready_interrupt
-                and not self.interrupt_waiting
+                and waiting_request is not None
+                and self._peek_benchmark_waiter(
+                    self.remote_kv_ready_interrupt, benchmark_token_quotas
+                )
+                is None
+                and self._peek_benchmark_waiter(
+                    self.interrupt_waiting, benchmark_token_quotas
+                )
+                is None
                 and not self._is_recovery_protected(request)
+                and waiting_request.status
+                in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                and (waiting_request.priority, waiting_request.arrival_time)
+                < (request.priority, request.arrival_time)
+                and (
+                    len(self.running) < self.max_num_running_reqs
+                    or self._get_parked_priority_admission_victim(
+                        waiting_request, scheduled_running_reqs
+                    )
+                    is not None
+                )
             ):
-                waiting_request = self.waiting.peek_request()
-                if (
-                    waiting_request.status
-                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
-                    and (
-                        waiting_request.priority,
-                        waiting_request.arrival_time,
-                    )
-                    < (request.priority, request.arrival_time)
-                    and (
-                        len(self.running) < self.max_num_running_reqs
-                        or self._get_parked_priority_admission_victim(
-                            waiting_request, scheduled_running_reqs
-                        )
-                        is not None
-                    )
-                ):
-                    priority_admission_request = waiting_request
-                    break
+                priority_admission_request = waiting_request
+                break
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -596,6 +675,8 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            if benchmark_quota is not None:
+                num_new_tokens = min(num_new_tokens, benchmark_quota)
 
             # Make sure the input position does not exceed the max model len or
             # request's max_tokens.
@@ -783,7 +864,25 @@ class Scheduler(SchedulerInterface):
                     # APPEND publishes more work. Do not recompute old work.
                     skipped_waiting_requests.prepend_request(self.waiting.pop_request())
                     continue
-                if self.remote_kv_ready_interrupt:
+                if benchmark_token_quotas is not None:
+                    active_waiting = next(
+                        (
+                            queue
+                            for queue in (
+                                self.remote_kv_ready_interrupt,
+                                self.interrupt_waiting,
+                                self.waiting,
+                            )
+                            if self._peek_benchmark_waiter(
+                                queue, benchmark_token_quotas
+                            )
+                            is not None
+                        ),
+                        None,
+                    )
+                    if active_waiting is None:
+                        break
+                elif self.remote_kv_ready_interrupt:
                     active_waiting = self.remote_kv_ready_interrupt
                 elif self.interrupt_waiting:
                     active_waiting = self.interrupt_waiting
@@ -798,7 +897,10 @@ class Scheduler(SchedulerInterface):
                     if active_waiting_is_interrupt
                     else skipped_waiting_requests
                 )
-                request = active_waiting.peek_request()
+                request = self._peek_benchmark_waiter(
+                    active_waiting, benchmark_token_quotas
+                )
+                assert request is not None
 
                 # Encoder cache lookup can acquire references. If no sequence
                 # slot can be obtained, do not let waiting work pin features
@@ -822,7 +924,9 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id,
                         )
-                        active_waiting.pop_request()
+                        self._pop_benchmark_waiter(
+                            active_waiting, request, benchmark_token_quotas
+                        )
                         skipped_active_requests.prepend_request(request)
                         continue
 
@@ -833,7 +937,9 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        active_waiting.pop_request()
+                        self._pop_benchmark_waiter(
+                            active_waiting, request, benchmark_token_quotas
+                        )
                         skipped_active_requests.prepend_request(request)
                         continue
 
@@ -848,7 +954,9 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    active_waiting.pop_request()
+                    self._pop_benchmark_waiter(
+                        active_waiting, request, benchmark_token_quotas
+                    )
                     skipped_active_requests.prepend_request(request)
                     continue
 
@@ -898,7 +1006,9 @@ class Scheduler(SchedulerInterface):
                                 request.num_computed_tokens = (
                                     logical_num_computed_tokens
                                 )
-                            active_waiting.pop_request()
+                            self._pop_benchmark_waiter(
+                                active_waiting, request, benchmark_token_quotas
+                            )
                             skipped_active_requests.prepend_request(request)
                             continue
 
@@ -942,11 +1052,17 @@ class Scheduler(SchedulerInterface):
                     ):
                         if restore_scheduling_base:
                             request.num_computed_tokens = logical_num_computed_tokens
-                        active_waiting.pop_request()
+                        self._pop_benchmark_waiter(
+                            active_waiting, request, benchmark_token_quotas
+                        )
                         skipped_active_requests.prepend_request(request)
                         continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if benchmark_token_quotas is not None:
+                        num_new_tokens = min(
+                            num_new_tokens, benchmark_token_quotas[request.request_id]
+                        )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1098,7 +1214,9 @@ class Scheduler(SchedulerInterface):
                             request_id=request.request_id,
                         )
 
-                admitted_request = active_waiting.pop_request()
+                admitted_request = self._pop_benchmark_waiter(
+                    active_waiting, request, benchmark_token_quotas
+                )
                 assert admitted_request is request
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -1194,6 +1312,11 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        if benchmark_token_quotas is not None:
+            assert all(
+                0 < count <= benchmark_token_quotas.get(request_id, 0)
+                for request_id, count in num_scheduled_tokens.items()
+            )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
