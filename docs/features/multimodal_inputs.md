@@ -54,6 +54,14 @@ When using multi-modal inputs, vLLM normally hashes each media item by content t
 
 Using UUIDs, you can also skip sending media data entirely if you expect cache hits for respective items. Note that the request will fail if the skipped media doesn't have a corresponding UUID, or if the UUID fails to hit the cache.
 
+On the LLM-RTC `junjie/baseSystem` branch, a missing processor-cache reference
+without a raw payload raises `MultiModalCacheMissError` from
+`vllm.multimodal.cache_exceptions`. It remains a `ValueError`, with structured
+item information and `phase="input_preprocessing"`, `admitted=False`. The
+LLM-RTC application uses this pre-admission signal for full-payload repair;
+vLLM does not automatically retry. See the
+[baseSystem integration notes](../base_system.md#multimodal-reference-misses).
+
 ??? code
 
     ```python

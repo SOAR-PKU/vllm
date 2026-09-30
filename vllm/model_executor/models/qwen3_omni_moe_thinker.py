@@ -195,6 +195,9 @@ class Qwen3_VisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        attn_backend: AttentionBackendEnum = AttentionBackendEnum.TORCH_SDPA,
+        use_upstream_fa: bool = False,
+        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -207,6 +210,9 @@ class Qwen3_VisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            attn_backend=attn_backend,
+            use_upstream_fa=use_upstream_fa,
+            attn_backend_override=attn_backend_override,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -334,6 +340,20 @@ class Qwen3Omni_VisionTransformer(nn.Module):
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
+        self.attn_backend = get_vit_attn_backend(
+            head_size=head_dim,
+            dtype=torch.get_default_dtype(),
+            attn_backend_override=attn_backend_override,
+        )
+        use_upstream_fa = False
+        if (
+            self.attn_backend != AttentionBackendEnum.FLASH_ATTN
+            and check_upstream_fa_availability(torch.get_default_dtype())
+        ):
+            self.attn_backend = AttentionBackendEnum.FLASH_ATTN
+            use_upstream_fa = True
+
+        # Keep block execution aligned with the tower's selected FA implementation.
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -344,6 +364,9 @@ class Qwen3Omni_VisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
+                    attn_backend=self.attn_backend,
+                    use_upstream_fa=use_upstream_fa,
+                    attn_backend_override=attn_backend_override,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -371,17 +394,6 @@ class Qwen3Omni_VisionTransformer(nn.Module):
                     for layer_idx in range(len(self.deepstack_visual_indexes))
                 ]
             )
-
-        self.attn_backend = get_vit_attn_backend(
-            head_size=head_dim,
-            dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
-        )
-        if (
-            self.attn_backend != AttentionBackendEnum.FLASH_ATTN
-            and check_upstream_fa_availability(torch.get_default_dtype())
-        ):
-            self.attn_backend = AttentionBackendEnum.FLASH_ATTN
 
     @property
     def dtype(self) -> torch.dtype:

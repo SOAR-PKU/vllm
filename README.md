@@ -112,6 +112,14 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## LLM-RTC baseSystem branch
+
+The `junjie/baseSystem` branch retains the v0.11.2 baseline with Qwen3-Omni
+vision attention backend alignment and structured multimodal reference-miss
+errors used by LLM-RTC's image UUID transport. See the
+[branch integration notes](docs/base_system.md) for the changes, error boundary,
+and validation limits.
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.

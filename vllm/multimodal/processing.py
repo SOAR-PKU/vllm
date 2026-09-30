@@ -23,6 +23,7 @@ import torch
 from typing_extensions import TypeVar, assert_never
 
 from vllm.logger import init_logger
+from vllm.multimodal.cache_exceptions import MultiModalCacheMissError
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.transformers_utils.tokenizer import AnyTokenizer, decode_tokens, encode_tokens
 from vllm.utils.collection_utils import flatten_2d_lists, full_groupby
@@ -1690,9 +1691,10 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             for idx in idxs:
                 data = mm_data_items[modality][idx]
                 if data is None:
-                    raise ValueError(
-                        f"Cache miss for {modality} at index {idx} "
-                        f"but data is not provided."
+                    raise MultiModalCacheMissError(
+                        modality=modality,
+                        index=idx,
+                        identifier=mm_hashes[modality][idx],
                     )
                 else:
                     missing_modality_data.append(data)
